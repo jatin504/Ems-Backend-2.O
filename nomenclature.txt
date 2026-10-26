@@ -1,0 +1,19 @@
+Block & PCS are Equivalent!!
+
+
+=> Inverter
+
+Plant_1_Block_1_Inverter_Inverter_1
+
+
+=> ESS
+
+Plant_1_PCS_1
+...
+Plant_1_PCS_1_ESS_1
+...
+Plant_1_PCS_1_ESS_1_Rack_1
+...
+Plant_1_PCS_1_ESS_1_Rack_1_Module_1
+...
+

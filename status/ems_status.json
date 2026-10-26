@@ -1,0 +1,10 @@
+{
+  "flags": {
+    "enable_capped_dynamic_strategy": 1,
+    "max_cycle_life_reached": 1,
+    "manual_override_enabled": 0,
+    "internal_controlling_executing": 1,
+    "enable_tou_tariff_strategy": 0,
+    "enable_peak_shaving_strategy": 0
+  }
+}

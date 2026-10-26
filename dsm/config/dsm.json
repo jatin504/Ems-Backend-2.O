@@ -1,0 +1,7 @@
+{
+    "mode_options" : {
+        "0" : "reserve_risk_mode",
+        "1" : "aggressive_revenue_mode"
+    },
+    "mode" : 1
+}

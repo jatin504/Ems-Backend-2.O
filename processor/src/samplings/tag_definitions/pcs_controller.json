@@ -1,0 +1,38 @@
+{
+    "SoC" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Temperature" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Frequency" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Voltage" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "PowerMode" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "ChargeAH" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "DischargeAH" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "ac_active_power" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "active_energy" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    }
+}

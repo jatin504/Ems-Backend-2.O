@@ -1,0 +1,11 @@
+{
+    "customer": "GUVNL Secondary Server",
+    "mac_id": "80:30:E0:42:43:D0",
+    "hardware_fingerprint": "80344e626da13ec9770ccb5eee199f5d2119183e3b571306c73fb29c65ac4be8",
+    "expiry": "2031-09-01",
+    "features": [
+        "SCADA",
+        "EMS"
+    ],
+    "signature": "AKDgspIuiGntPKdL1NGuT//eP8Jt4fzWE4OLsWtHYW81F+e5sEaLwr+2KqK+6PWuDz8MNRt4+q4rcma76KhwGf9hP0iQezvQADYY7zkVhljPzxJHVfDUjF4yVFjxevxXTObK46s8jJ5uEQ64WEvg8x488CcdO9klCA0wgl9w+X1Wam5HRkqpF/nE/nIbFE8AF1Q95/ulYhgzD7U3LVTI2TXntcRxBg5J3WMMvj4o4O7uEhMfwM+SKJYVD/sM7/+DihhuVeix+U7Rgvg9uj3aBrLnFD+cFN+s40QL/a0EAYFDV8M5rOlKiZ2hrXRKR8IhPat+gQ6+/36u3rcScq562Q=="
+}

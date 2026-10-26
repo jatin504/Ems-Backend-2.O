@@ -1,0 +1,50 @@
+{
+  "plant_type_option": {
+    "0": "pv_grid_captive",
+    "1": "pv_grid",
+    "2": "pv_bess",
+    "3": "bess",
+    "4": "pv_bess_grid",
+    "5": "pv_bess_grid_captive",
+    "6": "pv_bess_dg",
+    "7": "pv_bess_dg_grid",
+    "8": "pv_bess_dg_grid_captive"
+  },
+
+  "plant_type": 7,
+
+  "plant_config": {
+    "plantName": "Alaya Solar Green Energy Private Limited",
+
+    "location": {
+      "address": "Ariyalur, Tamil Nadu",
+      "latitude": 11.385654,
+      "longitude": 79.373025
+    },
+
+    "capacity": {
+      "dcCapacityMW": 6,
+      "acCapacityMW": 5,
+      "capacitorKVAR": 300
+    },
+
+    "plantOwner": "Alaya Solar Green Energy Private Limited",
+
+    "epcContractor": "",
+
+    "omContractor": "JK Wind Tech",
+
+    "codDate": "12-12-2025",
+
+    "description": "Utility scale PV + BESS + DG + Grid integrated solar power plant",
+
+    "inverters": [
+      {
+        "inverterName": "",
+        "serialNumber": "",
+        "dcCapacityMW": "",
+        "acCapacityMW": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+    "price_source": {
+        "price_source_options": {
+            "0": "day_ahead_market",
+            "1": "intraday_market",
+            "2": "api_url",
+            "3": "xls_file"
+        },
+        "price_source_default": "2",
+        "refresh_interval_minutes": 60
+    },
+    "caps_and_thresholds": {
+        "price_cap_threshold": 1.0,
+        "price_floor_threshold": 0.0,
+        "arbitrage_threshold": 8.0
+    },
+    "optimization_rule": {
+        "Aggressively_charge_when_price_below_price_floor_threshold": true,
+        "prevent_charging_when_price_above_price_cap_threshold": true,
+        "allow_discharge_when_profitable": true
+    }
+}

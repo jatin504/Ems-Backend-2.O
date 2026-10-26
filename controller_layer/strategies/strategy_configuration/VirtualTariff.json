@@ -1,0 +1,30 @@
+{
+    "tou_type_option" : {
+        "0" : "FlatTou",
+        "1" : "SmartTou"
+    },
+    "tou_type" : "1",
+
+    "flat_tou_rate" : 8,
+    "tou_prices" : {
+        "off_peak_price" : 5,
+        "mid_peak_price" : 10,
+        "on_peak_price" : 15
+    },
+
+    "aggregator_profit_share_percent" : 20,
+    "guaranteed_savings_per_month" : 5000,
+
+    "settlement_method_option" : {
+        "0" : "wholesale_arbitrage_calculation",
+        "1" : "baseline_load_method",
+        "2" : "export_settlement_method"
+    },
+    "settlement_method" : "0",
+
+    "arbitrage_strategy_option" : {
+        "0" : "maximise_revenue",
+        "1" : "balanced_cycles",
+        "2" : "solar_first_strategy"
+    }
+}

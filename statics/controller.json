@@ -1,0 +1,13 @@
+{
+    "max_soc" : 80,
+    "min_soc" : 20,
+    "battery_capacity" : 22000,
+    "efficiency" : 90,
+    "diff_tariff" : 2,
+    "ramp_rate_kw_per_min" : 500,
+    "power_rating_kw" : 1000000000000,
+
+    "peak_load_threshold" : 400,
+    
+    "grid_max_power" : 10000
+}

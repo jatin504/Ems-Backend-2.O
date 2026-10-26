@@ -1,0 +1,12 @@
+{
+
+    "bess_strategy_options" : {
+        "0" : "basic",
+        "1" : "timeOfUse",
+        "2" : "ADR",
+        "3" : "SmartTou",
+        "4" : "FlatTou",
+        "5" : "PeakShaving",
+        "6" : "Trading"
+    }
+}

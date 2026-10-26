@@ -1,0 +1,32 @@
+{
+    "setting" : {
+        "peak" : [
+            {
+                "start_time" : "13:01",
+                "end_time" : "14:00",
+                "price" : 0.30
+            }
+        ],
+        "off_peak" : [
+            {
+                "start_time" : "15:00",
+                "end_time" : "18:00",
+                "price" : 0.10
+            }
+        ],  
+        "mid_peak" : [
+            {
+                "start_time" : "07:00",
+                "end_time" : "12:00",
+                "price" : 0.20
+            }
+        ]
+    },
+    "optimization_rule" : {
+        "allow_charging_during_off_peak" : true,
+        "allow_charging_only_from_solar" : false,
+        "allow_grid_charging_if_price_below" : 3,
+        "discharging_during_peak" : true,
+        "reserve_soc" : 20
+    }
+}

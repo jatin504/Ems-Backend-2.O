@@ -1,0 +1,70 @@
+{
+    "SoC" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Amps" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Reactive_Power_kVAR" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Frequency_Hz" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Control_State" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "SoC_Setpoint" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "soc_min_threshold" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "soc_max_threshold" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "SoC_Write" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Active_Power_kW" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Charge_Energy_kWh" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Discharge_Energy_kWh" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "DoD" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "SoH" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Temperature" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Capacity_AH" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    }
+}

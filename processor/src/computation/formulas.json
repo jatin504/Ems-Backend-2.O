@@ -1,0 +1,18 @@
+{
+    "INV_Availability" : {
+        "deviceType" : "inverter",
+        "dataType" : "float",
+        "unit" : "%",
+        "formula" : {
+            "tags" : ["Active_Power_kW", "POA", "Current"]
+        }
+    },
+    "PR" : {
+        "deviceType" : "inverter",
+        "dataType" : "float",
+        "unit" : "%",
+        "formula" : {
+            "tags" : ["Daily_Energy_kWh", "DC"]
+        }
+    }
+}

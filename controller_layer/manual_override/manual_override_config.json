@@ -1,0 +1,9 @@
+{
+    "type": "charge",
+    "setpoint_kw": 1000,
+    "min_soc": 20,
+    "max_soc": 80,
+    "ramp_rate_kw_per_min": 1000,
+    "enabled": false,
+    "description": "Manual override to force charge at 1000 kW"
+}

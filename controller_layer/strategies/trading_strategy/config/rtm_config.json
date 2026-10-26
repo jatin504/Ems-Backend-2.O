@@ -1,0 +1,17 @@
+{
+    "enable_session_bidding": true,
+    "session_bidding_min": 30,
+    "final_gate_closure_bid_min": 15,
+    "enable_price_spike": true,
+    
+    "price_spike_trigger": 1.30, 
+    "enable_volume_imbalance_trigger": true,
+    "volume_imbalance_trigger": 0.85,    
+    "enable_renewable_forecast_adjustment": true,
+    "renewable_forecast_adjustment_percent": 5,
+
+    "default_bid_price": 3.25,           
+ 
+    "min_soc_limit": 20,
+    "max_soc_limit": 90
+}

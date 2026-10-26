@@ -1,0 +1,12 @@
+{
+    "bess_params": {
+        "max_charge_kw": 10000.0,
+        "max_discharge_kw": 500.0,
+        "min_soc": 20.0,
+        "max_soc": 90.0,
+        "grid_export_limit_kw": 5,
+        "grid_import_limit_kw": 5,
+        "max_cycles_per_day": 60,
+        "backup_soc": 60.0
+    }
+}

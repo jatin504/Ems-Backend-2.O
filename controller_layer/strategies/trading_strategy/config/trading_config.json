@@ -1,0 +1,15 @@
+{
+    "mode_options" : {
+        "0" : "reserve_risk_mode",
+        "1" : "aggressive_tarding_mode"
+    },
+    "mode" : 1,
+
+    "market_strategy_options": {
+        "0" : "rtm",
+        "1" : "dam"
+    },
+    "market_strategy": 0,
+
+    "final_gate_closure_bid_min": 4
+}

@@ -1,0 +1,85 @@
+{
+    "active_power" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "apparent_power" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "reactive_power" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "power_factor" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "dc_power" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "dc_voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "current" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "operation_state" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "setpoint" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "dc_current" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "frequency" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "energy_today" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "total_energy" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Alarm1" : {
+        "change" : true,
+        "resolution": 1
+    },
+    "efficiency" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "battery_voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "battery_soc" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "grid_voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "grid_frequency" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Alarm2" : {
+        "change" : true
+    }
+}

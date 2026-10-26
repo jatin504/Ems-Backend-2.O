@@ -1,0 +1,30 @@
+{
+    "voltage" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Frequency_Hz" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Power_kW" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Amps" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    },
+    "Daily_Energy_kWh" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Total_Energy_kWh" : {
+        "resolution" : 59,
+        "aggregation": "last"
+    },
+    "Total_PV_Power" : {
+        "resolution" : 59,
+        "aggregation": "avg"
+    }
+}

@@ -1,0 +1,32 @@
+{
+    "cycle_used_today": 0.101,
+    "max_cycles_per_day": 60,
+    "cycle_counting_method_option": {
+        "0": "throughput",
+        "1": "full_cycle",
+        "2": "dod_weighted"
+    },
+    "cycle_counting_method": "0",
+    "soc_safety_management": {
+        "min_safe_soc": 30,
+        "normal_soc_after_safety_charge": 80,
+        "standby_soc_hold_band": 50
+    },
+    "lockout_behaviour": {
+        "allow_safety_charging": true,
+        "allow_reserve_charging": true,
+        "block_economic_charging": true,
+        "block_discharging": false
+    },
+    "price_logic_overrides": {
+        "disable_aggrassive_charging": false,
+        "disable_peak_shaving": false,
+        "disable_arbitrage": false,
+        "disable_low_price_charging": true
+    },
+    "notifications": {
+        "notify_at_80_percent_usage": true,
+        "notify_lockout_activated": true,
+        "mobile_push_notification": false
+    }
+}

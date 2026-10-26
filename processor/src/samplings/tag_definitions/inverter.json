@@ -1,0 +1,230 @@
+{
+    "DC_Volt" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Current_B1" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Current_B2" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Current_B3" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Current_Total" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Volt_Total" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Volt_B1" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Volt_B2" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Volt_B3" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Current_L1" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Current_L2" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Current_L3" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "PF" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Apparent_Power" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Active_Power" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Reactive_Power" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Volt_L1L2" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Volt_L2L3" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "AC_Volt_L3L1" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Grid_Frequency" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Cab_AC" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Cab_DC" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Cab_Electronics" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Cab_Max" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Bridge_IGBT_Max" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Bridge_PCB_Max" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_Outside" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Temp_MV_Transformer" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "DC_Switch_1_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "DC_Switch_2_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "DC_Switch_3_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "AC_Circuit_Breaker_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Capacitor_Contactor_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Precharge_Contactor_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Total_FeedIn_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Total_Operating_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Total_DC_Energy" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Total_AC_Energy" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Daily_DC_Energy" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Daily_AC_Energy" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Fan_Cabinet_1_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Fan_Cabinet_2_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Fan_Bridge_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Heater_Cabinet_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Heater_Minus40_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Error_Location" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Inverter_Error_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Error_Number" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Inverter_Op_State" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "StartStop_Key_Switch" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Grid_Connect_Wait_Time" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Inverter_Serial_Number" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "GFDI_Switch_Status" : {
+        "resolution" : 59,
+        "aggregation" : "last"
+    },
+    "Active_Power_Setpoint" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Max_Apparent_Power_Setpoint" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Reactive_Power_Setpoint" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    },
+    "Power_Factor_Setpoint" : {
+        "resolution" : 59,
+        "aggregation" : "avg"
+    }
+}
