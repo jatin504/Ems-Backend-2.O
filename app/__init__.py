@@ -7,6 +7,7 @@ from app.routes.history_routes import history_bp
 from app.routes.audit_routes import audit_bp
 from app.routes.strategy_routes import strategy_bp
 from app.routes.get_timeseries_data import timeseries_bp
+from app.routes.raw_data_routes import raw_data_bp
 from app.routes.target_id_key_history_routes import target_id_key_history_bp
 from app.routes.current_strategy_routes import current_strategy
 from app.routes.strategy_configuration_api import strategy_configuration_bp
@@ -161,6 +162,8 @@ def create_app():
 
     # Time series
     app.register_blueprint(timeseries_bp)
+    # Raw history has its own endpoint
+    app.register_blueprint(raw_data_bp)
 
     # Energy Strategy Routes
     app.register_blueprint(strategy_bp)

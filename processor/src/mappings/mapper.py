@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Any, Dict
 
 from auto_configs.latest_telemetry_manager import LatestTelemetryManager
+from processor.src.samplings.src.raw_recording import RawRecorder
 from processor.src.mappings.telemetry_garbage import TelemetryGarbageDAO
 from runtime.environment_const import PUBLISH_SSE
 
@@ -39,6 +40,8 @@ class PostMapper:
         # Own the first snapshot store: mapped device tags, before aggregation.
         # This manager chooses JSON or Valkey using EMS_CACHE_BACKEND at startup.
         self.latest_telemetry_manager = LatestTelemetryManager()
+        # Raw history branches before averaging; JSON/Valkey remains the latest-value store.
+        self.raw_recorder = RawRecorder()
 
         # tune this based on CPU cores
         self.worker_count = 4
@@ -91,6 +94,10 @@ class PostMapper:
                     # ---------------------------------------------------------
 
                     for device_id, mapped_values in merged_devices.items():
+
+                        # Only configured critical aliases enter Victoria raw history.
+                        # This synchronous enqueue does not change any mapped values.
+                        self.raw_recorder.record(device_id, mapped_values)
 
                         # Send the same mapped tags to sampling independently of caching.
                         # The sampling worker later builds avg/last results (second layer).
