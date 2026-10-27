@@ -5,11 +5,7 @@ import logging
 
 from runtime_paths import DataPaths
 
-from utils.process_pool import PROCESS_POOL
-
-from diskcache import Cache
-
-cache = Cache("sampled_device_cache")
+from utils.telemetry_store import TelemetryStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +20,10 @@ class PlantArchitectureResolver:
 
         # device_id -> Path
         self._device_cache = {}
+        # Latest aggregate values use the sampled-stage store; plant JSON remains
+        # the source of tag names/units/configuration. The .env backend is shared
+        # with mapped caching, but the keys/files are separate.
+        self.telemetry_store = TelemetryStore("sampled")
 
     def _find_device_file(self, device_id):
         """
@@ -78,14 +78,8 @@ class PlantArchitectureResolver:
         :param device_id: The device ID (e.g., 'block_1_inverter_inverter_1').
         :return: A dictionary representing the device's data.
         """
-        device_file = self._find_device_file(device_id)
+        return await asyncio.to_thread(self.resolve_block_device_sync, device_id)
 
-        if not device_file.exists():
-            raise FileNotFoundError(f"Device file not found: {device_file}")
-
-        with open(device_file, 'r') as f:
-            return json.load(f)
-        
     def resolve_block_device_sync(self, device_id):
         """
         Resolve a specific device file by searching for {device_id}.json.
@@ -97,8 +91,11 @@ class PlantArchitectureResolver:
         if not device_file.exists():
             raise FileNotFoundError(f"Device file not found: {device_file}")
 
+        # Load the existing plant structure/metadata first, then overlay sampled
+        # values in memory. Reading through this method never rewrites this file.
         with open(device_file, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+        return self._overlay_sampled(device_id, data)
 
     async def previous_update_block_device(self, device_id, updates):
         """
@@ -107,44 +104,49 @@ class PlantArchitectureResolver:
         :param updates: A dictionary of updates to apply to the device file.
         """
 
-        loop = asyncio.get_running_loop()
-
-        await loop.run_in_executor(
-            PROCESS_POOL,
-            self.previous_update_device_file,
-            device_id,
-            updates,
-        )
+        await asyncio.to_thread(self.previous_update_device_file, device_id, updates)
     
-    async def update_block_devices(self, batch):
-        loop = asyncio.get_running_loop()
+    def _overlay_sampled(self, device_id, data):
+        """Preserve plant JSON metadata and overlay current sampled tag values."""
+        # read() selects the sampled JSON file or Valkey hash from .env.
+        sampled = self.telemetry_store.read(device_id)
+        if sampled is None:
+            # Preserve legacy bootstrap behavior. These plant values may be old;
+            # a successful API response alone is therefore not proof of a cache hit.
+            return data
+        # Match lowercase sampled aliases to original plant key casing.
+        keys = {key.lower(): key for key in data}
+        for tag, value in sampled.items():
+            key = keys.get(tag.lower(), tag)
+            if isinstance(data.get(key), dict):
+                # Keep alias, unit and datatype; replace only the current value.
+                data[key]["value"] = value
+            else:
+                data[key] = {"value": value}
+        return data
 
-        await loop.run_in_executor(
-            PROCESS_POOL,
-            self.update_device_cache,
-            batch,
-        )
+    async def update_block_devices(self, batch):
+        """Accept the sampled batch produced by ResolutionSampling.final_flush().
+
+        Offload synchronous snapshot writes to a thread. Do not change the
+        independent Victoria queue or overwrite plant architecture metadata.
+        """
+        await asyncio.to_thread(self.update_device_cache, batch)
 
     def update_device_cache(self, batch):
-        with cache.transact():
-            for device_id, payload in batch:
-                key = f"device:{device_id}"
+        """Save each device's sampled result through the common backend store.
 
-                data = cache.get(key, {})
-
-                for k, value in payload.items():
-                    json_key = k.lower()
-
-                    if json_key in data and isinstance(data[json_key], dict):
-                        data[json_key]["value"] = value
-                    else:
-                        data[json_key] = {"value": value}
-
-                data["app_status"] = {
-                    "value": payload.get("app_status", 500)
-                }
-
-                cache[key] = data
+        batch contains (device_id, payload) pairs. Normalize tags to lowercase,
+        merge the latest values, and log per-device failures so other devices
+        can still be processed. This does not insert historical records.
+        """
+        for device_id, payload in batch:
+            try:
+                self.telemetry_store.merge(
+                    device_id, {k.lower(): v for k, v in payload.items()}
+                )
+            except Exception:
+                logger.exception("Sampled telemetry cache write failed for %s", device_id)
 
     def update_device_files(self, batch):
         for device_id, payload in batch:

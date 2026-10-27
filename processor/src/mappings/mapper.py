@@ -36,6 +36,8 @@ class PostMapper:
     def __init__(self, sampling_queue: asyncio.Queue, sse_broadcaster):
         self.sampling_queue = sampling_queue
         self.see_publisher = sse_broadcaster
+        # Own the first snapshot store: mapped device tags, before aggregation.
+        # This manager chooses JSON or Valkey using EMS_CACHE_BACKEND at startup.
         self.latest_telemetry_manager = LatestTelemetryManager()
 
         # tune this based on CPU cores
@@ -90,6 +92,9 @@ class PostMapper:
 
                     for device_id, mapped_values in merged_devices.items():
 
+                        # Send the same mapped tags to sampling independently of caching.
+                        # The sampling worker later builds avg/last results (second layer).
+                        # This queue insertion itself does not write JSON or Valkey.
                         # Sampling queue
                         await self.sampling_queue.put(
                             mapped_values
@@ -117,7 +122,9 @@ class PostMapper:
                         #     data=device.mapped_values
                         # )
 
-                        # Latest telemetry
+                        # FIRST CACHE ENTRY POINT (after mapping): save latest named tags.
+                        # save_device_data -> TelemetryStore.amerge -> merge:
+
                         await self.latest_telemetry_manager.save_device_data(
                             device_id=device_id,
                             data=mapped_values,
