@@ -11,6 +11,7 @@ from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
+from utils.historian_common import record_month
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class RawRecorder:
             # json.dumps escapes label quotes, newlines and backslashes correctly.
             labels = (f'device={json.dumps(device_id)},'
                       f'database={json.dumps(self.database)},'
-                      'resolution="raw_1_sec"')
+                      f'resolution="raw_1_sec",record_month="{record_month(now)}"')
             lines.append(f"{metric}{{{labels}}} {float(value)} {now}")
             accepted.append(identity)
         if lines:

@@ -52,8 +52,8 @@ async def stream():
     """Stream latest mapped snapshots for exact comma-separated device IDs.
 
     GET-only extension: both POST handlers above are unchanged. This is snapshot
-    polling, not Valkey Pub/Sub. JSON mode also retains the original broadcaster
-    messages; Valkey mode reads existing hashes written by the mapping cache.
+    polling, not Valkey Pub/Sub. Both backends retain the original HTTP
+    broadcaster messages alongside snapshots written by the mapping cache.
     """
     # Split ?topics=a,b, trim spaces, ignore blanks and deduplicate in input order.
     topics = list(dict.fromkeys(
@@ -67,16 +67,17 @@ async def stream():
     broadcaster = current_app.broadcaster
 
     async def event_stream():
-        """Poll selected snapshots and retain legacy broadcaster delivery in JSON mode."""
+        """Poll selected snapshots and receive HTTP broadcasts for either backend."""
         # Capture .env backend settings for this stream. Mapped = instantaneous
         # named tags, not the minute-level sampled values used by the POST API.
         store = TelemetryStore("mapped")
-        queues = []  # Legacy local broadcaster queues; empty in Valkey mode.
+        queues = []  # HTTP publisher subscriptions are independent of cache backend.
         last = {}  # Per-client duplicate suppression; NOT the persistent cache.
         try:
-            if store.backend == "json":
-                for topic in topics:
-                    queues.append(await broadcaster.register(topic))
+            # POST publishers use this local broadcaster for both JSON and Valkey.
+            # Register before reading snapshots so updates are queued during reads.
+            for topic in topics:
+                queues.append(await broadcaster.register(topic))
             while True:
                 sent = False
                 for topic in topics:
@@ -97,7 +98,7 @@ async def stream():
                         yield "data: " + json.dumps({"topic": topic, "message": snapshot}) + "\n\n"
 
                 if queues:
-                    # Preserve existing HTTP-published messages in JSON mode.
+                    # Preserve existing HTTP-published messages for either backend.
                     tasks = [asyncio.create_task(queue.get()) for queue in queues]
                     try:
                         # Wait for any topic, at most one second. This is a queue
