@@ -1,0 +1,9 @@
+{
+  "instances": 1,
+  "api_host": "0.0.0.0",
+  "first_api_port": 5180,
+  "proxy_backend_host": "172.28.112.1",
+  "proxy_port": 5179,
+  "tls_pem": "",
+  "maxconn": 2000
+}

@@ -146,7 +146,6 @@ async def stream():
         "Cache-Control": "no-cache",
         "Content-Type": "text/event-stream",
         "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
         "X-Accel-Buffering": "no",
         "Content-Encoding": "identity",
     })

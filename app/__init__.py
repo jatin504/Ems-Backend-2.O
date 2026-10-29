@@ -1,5 +1,4 @@
 from quart import Quart
-from quart_cors import cors
 from dotenv import load_dotenv
 from app.routes.stream_routes import stream_bp
 from app.routes.latest_routes import latest_bp
@@ -82,6 +81,8 @@ from app.routes.notification_routes import notification_bp
 from app.routes.twin_schedule_execute import twin_schedule_exec_bp
 
 from app.middleware.compress_response import compress_response
+from app.middleware.api_scaling import configure_api_scaling
+from app.middleware.cors_config import configure_cors
 import logging
 import os
 import json
@@ -104,10 +105,11 @@ logging.basicConfig(
 
 def create_app():
     app = Quart(__name__)
+    configure_api_scaling(app)
     # Enable compression
     # compress_response(app)
 
-    cors(app, allow_origin="*", allow_headers=["*", "X-Internal-API-Key"], allow_methods=["GET", "POST", "WEBSOCKET"], allow_credentials=False,)
+    configure_cors(app)
 
     @app.route("/ping")
     async def health():
@@ -236,6 +238,7 @@ def create_app():
     async def startup():
         # await broadcaster.start()
         await broadcaster.start_cleanup_task()
-        await warm_up_db_connection()
+        # Read workers must not write the shared status JSON during startup.
+        await warm_up_db_connection(write_health_flag=app.config["EMS_API_ROLE"] == "primary")
 
     return app, broadcaster
