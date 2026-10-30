@@ -80,7 +80,7 @@ def render_haproxy(config):
         "    acl query_post method POST",
         "    acl query_prefix path_beg " + " ".join(READ_PREFIXES),
         "    acl query_exact path " + " ".join(READ_POST_PATHS),
-        "    acl stream_path path -i /stream /stream/",
+        "    acl stream_path path -i /stream /stream/ /api/v2/stream /api/v2/stream/",
         "    acl probe_path path /health /ping",
         "    use_backend ems_reads if query_get probe_path",
         "    use_backend ems_reads if query_get query_prefix",
