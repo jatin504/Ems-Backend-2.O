@@ -1,129 +1,192 @@
-"""Record explicitly selected, unaggregated engineering values in VictoriaMetrics."""
-
+"""Mapped readings -> awaited raw queue -> batched VictoriaMetrics HTTP writes."""
 import asyncio
+from dataclasses import dataclass
 import json
-import logging
 import math
 import os
-import re
+import random
 import time
-from pathlib import Path
 
 import aiohttp
-from dotenv import load_dotenv
-from utils.historian_common import record_month
 
-load_dotenv()
-logger = logging.getLogger(__name__)
-# A separate bounded queue prevents raw data from being interpreted as minute rows.
-RAW_VM_QUEUE = asyncio.Queue(maxsize=10_000)
+from utils.historian_common import record_month
+from utils.raw_insertion_logging import raw_logger
+from utils.raw_vm_queue import RAW_VM_QUEUE, RawPacket, positive_float, positive_int
+from .raw_tag_selection import load_raw_tags
 
 
 class RawRecorder:
-    """Select exact aliases per device type/device ID; never auto-select every tag."""
+    """Select raw tags and await queue space; perform no network or disk writes."""
 
-    def __init__(self, policy=None, queue=None):
+    def __init__(self, queue=None, definitions_path=None):
         self.queue = queue if queue is not None else RAW_VM_QUEUE
         self.enabled = os.getenv("EMS_RAW_VM_ENABLED", "false").lower() == "true"
+        self.selected = {}
         self.last_second = {}
-        self.database = os.getenv("PRIMARY_DB_NAME", "ems")
-        if not self.enabled and policy is None:
-            self.policy = {}
-            return
-        # A configured path is relative to the repository, independent of EMS_DATA_DIR.
-        path = Path(os.getenv("EMS_RAW_TAGS_FILE", "config/raw_historian_tags.json"))
-        if not path.is_absolute():
-            path = Path(__file__).resolve().parents[4] / path
-        self.policy = policy if policy is not None else json.loads(path.read_text(encoding="utf-8-sig"))
-        for section in ("device_types", "devices"):
-            rules = self.policy.get(section, {})
-            if not isinstance(rules, dict) or any(
-                not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags)
-                for tags in rules.values()
-            ):
-                raise ValueError(f"Raw historian {section} must map names to lists of exact aliases")
-        logger.info("Raw historian policy loaded: %s", path)
+        self.enqueued_samples = 0
+        self._device_locks = {}
+        self.packet_size = min(positive_int("EMS_RAW_PACKET_SAMPLES", 256),
+                               positive_int("EMS_RAW_BATCH_SAMPLES", 5000))
+        if self.enabled:
+            self.logger = raw_logger()
+            self.selected = load_raw_tags(definitions_path)
+            self.logger.info("Raw selection loaded enabled_tags=%s queue_packets=%d packet_samples=%d",
+                             {kind: len(tags) for kind, tags in self.selected.items() if tags},
+                             self.queue.maxsize, self.packet_size)
 
-    def record(self, device_id, mapped_values, timestamp_ms=None):
-        """Queue at most one finite numeric sample per selected tag per second.
+    async def record(self, device_id, mapped_values, timestamp_ms=None):
+        """Called by PostMapper.worker before the existing sampling enqueue.
 
-        Timestamp is backend receipt time: the current mapper has no source timestamp.
-        Values are decoded/scaled engineering values, not encoded Modbus registers.
+        A full raw queue pauses this producer until space is available. Per-device
+        locking keeps same-second deduplication correct across mapper workers.
         """
         if not self.enabled:
             return
-        now = int(time.time() * 1000) if timestamp_ms is None else timestamp_ms
-        second = now // 1000
-        lines, accepted = [], []
-        for alias, meta in mapped_values.items():
-            if not isinstance(meta, dict):
+        timestamp = int(time.time() * 1000) if timestamp_ms is None else timestamp_ms
+        lock = self._device_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            samples = self._select_samples(device_id, mapped_values, timestamp // 1000)
+            for offset in range(0, len(samples), self.packet_size):
+                chunk = samples[offset:offset + self.packet_size]
+                packet = RawPacket(str(device_id), timestamp,
+                                   tuple((metric, value) for alias, metric, value in chunk))
+                # Same contract as sampling_queue.put: wait, never drop on QueueFull.
+                await self.queue.put(packet)
+                self.enqueued_samples += len(chunk)
+                for alias, metric, value in chunk:
+                    self.last_second[(device_id, alias)] = timestamp // 1000
+
+    def _select_samples(self, device_id, mapped_values, second):
+        """Keep valid selected readings, at most one per device/tag/second."""
+        samples = []
+        for alias, metadata in mapped_values.items():
+            if not isinstance(metadata, dict) or metadata.get("type") == "alarm":
                 continue
-            # An explicit device rule overrides the type rule, including an empty list.
-            tags = self.policy.get("devices", {}).get(device_id)
-            if tags is None:
-                tags = self.policy.get("device_types", {}).get(meta.get("device_type"), [])
-            if alias not in tags or meta.get("type") == "alarm":
+            device_type = str(metadata.get("device_type", "")).lower()
+            metric = self.selected.get(device_type, {}).get(alias)
+            if metric is None or second <= self.last_second.get((device_id, alias), -1):
                 continue
-            value = meta.get("value")
-            if not isinstance(value, (int, float)) or not math.isfinite(value):
+            value = metadata.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 continue
-            identity = (device_id, alias)
-            if second <= self.last_second.get(identity, -1):
-                continue
-            metric = alias.lower()
-            if not re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*", metric):
-                logger.warning("Raw historian skipped invalid metric alias: %s", alias)
-                continue
-            # json.dumps escapes label quotes, newlines and backslashes correctly.
-            labels = (f'device={json.dumps(device_id)},'
-                      f'database={json.dumps(self.database)},'
-                      f'resolution="raw_1_sec",record_month="{record_month(now)}"')
-            lines.append(f"{metric}{{{labels}}} {float(value)} {now}")
-            accepted.append(identity)
-        if lines:
-            try:
-                self.queue.put_nowait(lines)
-            except asyncio.QueueFull:
-                # Prefer a visible data-loss warning over freezing device polling.
-                logger.error("RAW DATA LOSS: queue full; dropped %d samples for %s", len(lines), device_id)
-            else:
-                for identity in accepted:
-                    self.last_second[identity] = second
+            samples.append((alias, metric, value))
+        return samples
+
+
+@dataclass(frozen=True, slots=True)
+class RawBatch:
+    packets: list[RawPacket]
+    sample_count: int
+    completed_queue_items: int
 
 
 class RawVictoriaWriter:
-    """Write raw batches independently, retaining the current batch on HTTP failure."""
+    """Consume raw packets, batch them, and acknowledge only after HTTP 204."""
 
     def __init__(self, queue=None, url=None):
         self.queue = queue if queue is not None else RAW_VM_QUEUE
         host = os.getenv("PRIMARY_BACKEND_HOST", "127.0.0.1")
         self.url = url or os.getenv("EMS_RAW_VM_URL", f"http://{host}:8428/api/v1/import/prometheus")
-
-    async def send(self, session, lines):
-        """Return success only on HTTP 204; caller retries the same timestamped data."""
-        try:
-            async with session.post(self.url, data="\n".join(lines),
-                                    headers={"Content-Type": "text/plain"}) as response:
-                if response.status == 204:
-                    logger.info("Victoria RAW accepted %d samples", len(lines))
-                    return True
-                logger.error("Victoria RAW HTTP %s: %s", response.status, (await response.text())[:500])
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            logger.exception("Victoria RAW unavailable; retaining batch for retry")
-        return False
+        self.database_label = json.dumps(os.getenv("PRIMARY_DB_NAME", "ems"))
+        self.batch_size = positive_int("EMS_RAW_BATCH_SAMPLES", 5000)
+        self.flush_seconds = positive_float("EMS_RAW_FLUSH_SECONDS", 1)
+        self.log_seconds = positive_float("EMS_RAW_LOG_INTERVAL_SECONDS", 30)
+        self.retry_seconds = positive_float("EMS_RAW_RETRY_SECONDS", 1)
+        self.retry_max = max(self.retry_seconds, positive_float("EMS_RAW_RETRY_MAX_SECONDS", 30))
+        self.logger = raw_logger()
+        self.accepted_samples = self.accepted_batches = self.failures = 0
+        self._last_summary = self._last_error = float("-inf")
+        self._remaining_packet = None
 
     async def start(self):
-        """Drain bounded batches; retry outages without changing sampled-cache behavior."""
+        """One connection/session and one ordered writer for the raw queue."""
+        self.logger.info("Raw writer started batch_samples=%d flush_seconds=%s endpoint=%s",
+                         self.batch_size, self.flush_seconds, self.url)
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             while True:
-                lines = list(await self.queue.get())
-                count = 1
-                # Coalesce queued device packets without waiting for a minute boundary.
-                while len(lines) < 5000 and not self.queue.empty():
-                    lines.extend(self.queue.get_nowait())
-                    count += 1
-                while not await self.send(session, lines):
-                    await asyncio.sleep(2)
-                for _ in range(count):
+                batch = await self._collect_batch()
+                payload = await asyncio.to_thread(self._encode_batch, batch.packets)
+                await self._send_with_retry(session, payload)
+                # A split queue item is acknowledged only after its final part.
+                for _ in range(batch.completed_queue_items):
                     self.queue.task_done()
+                self.accepted_samples += batch.sample_count
+                self.accepted_batches += 1
+                self._log_summary(batch.sample_count, len(payload))
+
+    async def _collect_batch(self):
+        """Stop collecting at the sample limit or the first-packet deadline."""
+        packet = self._remaining_packet
+        self._remaining_packet = None
+        if packet is None:
+            packet = await self.queue.get()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.flush_seconds
+        packets, sample_count, completed_items = [], 0, 0
+        while True:
+            space = self.batch_size - sample_count
+            if len(packet.samples) > space:
+                packets.append(RawPacket(packet.device, packet.timestamp, packet.samples[:space]))
+                self._remaining_packet = RawPacket(packet.device, packet.timestamp, packet.samples[space:])
+                sample_count += space
+                break
+            packets.append(packet)
+            sample_count += len(packet.samples)
+            completed_items += 1
+            remaining_seconds = deadline - loop.time()
+            if sample_count == self.batch_size or remaining_seconds <= 0:
+                break
+            try:
+                packet = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                try:
+                    packet = await asyncio.wait_for(self.queue.get(), remaining_seconds)
+                except asyncio.TimeoutError:
+                    break
+        return RawBatch(packets, sample_count, completed_items)
+
+    def _encode_batch(self, packets):
+        """Build VM import text off the event loop; called once per batch."""
+        lines = []
+        for packet in packets:
+            labels = (f'device={json.dumps(packet.device)},database={self.database_label},'
+                      f'resolution="raw_1_sec",record_month="{record_month(packet.timestamp)}"')
+            lines.extend(f"{metric}{{{labels}}} {float(value)} {packet.timestamp}"
+                         for metric, value in packet.samples)
+        return "\n".join(lines).encode("utf-8")
+
+    async def _send_with_retry(self, session, payload):
+        """Hold this exact payload until accepted; do not dequeue another batch."""
+        delay = self.retry_seconds
+        while not await self.send(session, payload):
+            await asyncio.sleep(delay * random.uniform(0.9, 1.1))
+            delay = min(self.retry_max, delay * 2)
+
+    async def send(self, session, payload):
+        """HTTP acceptance is not proof that VM native retention kept the samples."""
+        try:
+            async with session.post(self.url, data=payload,
+                                    headers={"Content-Type": "text/plain"}) as response:
+                if response.status == 204:
+                    return True
+                reason = f"HTTP {response.status}: {(await response.text())[:500]}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            reason = str(error)
+        self.failures += 1
+        now = time.monotonic()
+        if now - self._last_error >= self.log_seconds:
+            self.logger.error("Raw VM unavailable; retrying same batch failures_total=%d reason=%s",
+                              self.failures, reason)
+            self._last_error = now
+        return False
+
+    def _log_summary(self, samples, payload_bytes):
+        now = time.monotonic()
+        if now - self._last_summary < self.log_seconds:
+            return
+        self.logger.info("Raw HTTP accepted samples_total=%d batches_total=%d last_batch=%d bytes=%d queue_packets=%d failures_total=%d",
+                         self.accepted_samples, self.accepted_batches, samples, payload_bytes,
+                         self.queue.qsize(), self.failures)
+        self._last_summary = now

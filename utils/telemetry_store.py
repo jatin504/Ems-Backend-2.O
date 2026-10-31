@@ -15,6 +15,15 @@ load_dotenv()
 
 class TelemetryStore:
     """Keep the existing JSON files or use Valkey for latest device snapshots."""
+    # Read old hashes and new JSON strings atomically, including during migration.
+    _SNAPSHOT = """
+    if redis.call('EXISTS', KEYS[1]) == 0 then return nil end
+    local kind = redis.call('TYPE', KEYS[1]).ok
+    if kind == 'none' then return nil end
+    if kind == 'string' then return {'string', redis.call('GET', KEYS[1])} end
+    if kind == 'hash' then return {'hash', redis.call('HGETALL', KEYS[1])} end
+    return redis.error_reply('Unsupported telemetry key type: ' .. kind)
+    """
     def __init__(self, stage, base_dir=None, client=None):
         # Validate configuration before creating a backend; JSON needs no server/client.
         if stage not in {"mapped", "sampled"}:
@@ -42,7 +51,7 @@ class TelemetryStore:
             from valkey.retry import Retry
             self.client = valkey.Valkey.from_url(
                 os.getenv("EMS_VALKEY_URL", "valkey://localhost:6379/0"),
-                # Decode hash fields as strings; values are JSON-decoded in read().
+                # JSON snapshots are decoded in read(); no RedisJSON module needed.
                 decode_responses=True,
                 # Bound cache network waits; retry count below is deliberately zero.
                 socket_connect_timeout=1, socket_timeout=1,
@@ -71,22 +80,28 @@ class TelemetryStore:
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if self.backend == "valkey":
-            # One transaction: no read-modify-write race between mapping workers.
-            # JSON encoding here creates strings inside a Valkey hash, not files.
-            # "data:" distinguishes tag fields from the hash's update timestamp.
-            fields = {"data:" + k: json.dumps(v) for k, v in values.items()}
-            fields["time_stamp"] = now
-            with self.client.pipeline(transaction=True) as pipe:
-                # HSET updates supplied tags without deleting other register blocks.
-                # These commands are queued locally until pipe.execute() below.
-                pipe.hset(self.key(device_id), mapping=fields)
-                if self.ttl:
-                    pipe.expire(self.key(device_id), self.ttl)
-                else:
-                    pipe.persist(self.key(device_id))
-                # Actual Valkey transaction execution: HSET plus expiry/persist.
-                pipe.execute()
-            # Prevent also executing the JSON branch: only one backend is selected.
+            from valkey.exceptions import WatchError
+            key = self.key(device_id)
+            # WATCH prevents independent register blocks overwriting each other.
+            # SET atomically replaces a legacy hash with the merged JSON document.
+            for attempt in range(32):
+                try:
+                    with self.client.pipeline(transaction=True) as pipe:
+                        pipe.watch(key)
+                        data = self._decode_snapshot(pipe.eval(self._SNAPSHOT, 1, key)) or {}
+                        data.update(values)
+                        document = json.dumps({"time_stamp": now, "data": data}, indent=2)
+                        pipe.multi()
+                        # SET without EX also removes a previous TTL when ttl=0.
+                        if self.ttl:
+                            pipe.set(key, document, ex=self.ttl)
+                        else:
+                            pipe.set(key, document)
+                        pipe.execute()
+                    return
+                except WatchError:
+                    if attempt == 31:
+                        raise
             return
         path = self._path(device_id)
         # Lock across processes; replace the JSON atomically after a durable flush.
@@ -110,19 +125,33 @@ class TelemetryStore:
     def read(self, device_id):
         """Return the same tag dictionary regardless of the configured backend."""
         if self.backend == "valkey":
-            # Actual Valkey read. No automatic fallback to a previous JSON session.
-            fields = self.client.hgetall(self.key(device_id))
-            if not fields:
-                return None
-            # Remove "data:" and recover the original Python tag objects/scalars.
-            # The hash-level time_stamp is intentionally not returned as a tag.
-            return {k[5:]: json.loads(v) for k, v in fields.items() if k.startswith("data:")}
+            return self._decode_snapshot(self.client.eval(self._SNAPSHOT, 1, self.key(device_id)))
         path = self._path(device_id)
         if not path.exists():
             return None
         # Same return shape as Valkey: only the tag dictionary, not the file envelope.
         with path.open(encoding="utf-8") as stream:
             return json.load(stream)["data"]
+
+    @staticmethod
+    def _decode_snapshot(snapshot):
+        """Keep the public tag dictionary identical for JSON and Valkey callers."""
+        if snapshot is None:
+            return None
+        kind, payload = snapshot
+        if isinstance(kind, bytes):
+            kind = kind.decode()
+        if kind == "string":
+            document = json.loads(payload)
+            if not isinstance(document, dict) or not isinstance(document.get("data"), dict):
+                raise ValueError("Telemetry snapshot must contain a data object")
+            return document["data"]
+        if kind == "hash":
+            fields = dict(zip(payload[::2], payload[1::2]))
+            return {(k.decode() if isinstance(k, bytes) else k)[5:]: json.loads(v)
+                    for k, v in fields.items()
+                    if (k.decode() if isinstance(k, bytes) else k).startswith("data:")}
+        raise ValueError("Unsupported telemetry snapshot type")
 
     async def amerge(self, device_id, values):
         """Async write wrapper used by PostMapper through LatestTelemetryManager."""

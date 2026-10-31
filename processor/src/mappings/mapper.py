@@ -96,8 +96,8 @@ class PostMapper:
                     for device_id, mapped_values in merged_devices.items():
 
                         # Only configured critical aliases enter Victoria raw history.
-                        # This synchronous enqueue does not change any mapped values.
-                        self.raw_recorder.record(device_id, mapped_values)
+                        # This enqueue waits for raw queue space; the raw writer sends HTTP separately.
+                        await self.raw_recorder.record(device_id, mapped_values)
 
                         # Send the same mapped tags to sampling independently of caching.
                         # The sampling worker later builds avg/last results (second layer).
@@ -206,6 +206,8 @@ class CompiledMapper:
             data_type = mapping["dataType"]
 
             self.entries.append({
+
+                "metadata": dict(mapping),
 
                 "start_addr": mapping.get("srno", int(mapping["register"])),
 
@@ -327,6 +329,8 @@ class CacheMapper:
 
             obj = {
 
+                **entry["metadata"],
+
                 "block": block,
                 "device_type": device_type,
                 "device_id": device_id,
@@ -438,6 +442,8 @@ class Mapper:
                         value = None
 
                 mapped_values[alias] = {
+                    # Preserve the complete model metadata alongside live values.
+                    **mapping,
                     "block": block,
                     "device_type": device_type,
                     "device_id": device_id,
