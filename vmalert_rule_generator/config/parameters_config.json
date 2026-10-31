@@ -1,0 +1,17 @@
+{
+  "_comment": "Resolution schedule only. Paths and source selection come from .env. Tag rules.enabled defaults to false.",
+  "resolutions": [
+    {
+      "name": "5m",
+      "interval": "5m",
+      "window": "5m",
+      "enabled": true
+    },
+    {
+      "name": "15m",
+      "interval": "15m",
+      "window": "15m",
+      "enabled": true
+    }
+  ]
+}

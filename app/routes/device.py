@@ -6,6 +6,7 @@ from model import create_tables_from_json
 from app.services.device_services import DeviceService
 
 from runtime_paths import DataPaths
+from utils.atomic_json import atomic_write_json
 
 device = Blueprint("device", __name__, url_prefix="/api/device")
 
@@ -88,8 +89,7 @@ async def add_device():
     config["devices"] = list(existing_devices.values())
 
     os.makedirs(os.path.dirname(device_config), exist_ok=True)
-    with open(device_config, "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_write_json(device_config, config)
 
     architect = PlantArchitect(
         config_path="config/device_config.json",

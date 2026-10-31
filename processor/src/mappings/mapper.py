@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Any, Dict
 
 from auto_configs.latest_telemetry_manager import LatestTelemetryManager
+from processor.src.samplings.src.raw_recording import RawRecorder
 from processor.src.mappings.telemetry_garbage import TelemetryGarbageDAO
 from runtime.environment_const import PUBLISH_SSE
 
@@ -36,7 +37,11 @@ class PostMapper:
     def __init__(self, sampling_queue: asyncio.Queue, sse_broadcaster):
         self.sampling_queue = sampling_queue
         self.see_publisher = sse_broadcaster
+        # Own the first snapshot store: mapped device tags, before aggregation.
+        # This manager chooses JSON or Valkey using EMS_CACHE_BACKEND at startup.
         self.latest_telemetry_manager = LatestTelemetryManager()
+        # Raw history branches before averaging; JSON/Valkey remains the latest-value store.
+        self.raw_recorder = RawRecorder()
 
         # tune this based on CPU cores
         self.worker_count = 4
@@ -90,6 +95,13 @@ class PostMapper:
 
                     for device_id, mapped_values in merged_devices.items():
 
+                        # Only configured critical aliases enter Victoria raw history.
+                        # This enqueue waits for raw queue space; the raw writer sends HTTP separately.
+                        await self.raw_recorder.record(device_id, mapped_values)
+
+                        # Send the same mapped tags to sampling independently of caching.
+                        # The sampling worker later builds avg/last results (second layer).
+                        # This queue insertion itself does not write JSON or Valkey.
                         # Sampling queue
                         await self.sampling_queue.put(
                             mapped_values
@@ -117,7 +129,9 @@ class PostMapper:
                         #     data=device.mapped_values
                         # )
 
-                        # Latest telemetry
+                        # FIRST CACHE ENTRY POINT (after mapping): save latest named tags.
+                        # save_device_data -> TelemetryStore.amerge -> merge:
+
                         await self.latest_telemetry_manager.save_device_data(
                             device_id=device_id,
                             data=mapped_values,
@@ -192,6 +206,8 @@ class CompiledMapper:
             data_type = mapping["dataType"]
 
             self.entries.append({
+
+                "metadata": dict(mapping),
 
                 "start_addr": mapping.get("srno", int(mapping["register"])),
 
@@ -313,6 +329,8 @@ class CacheMapper:
 
             obj = {
 
+                **entry["metadata"],
+
                 "block": block,
                 "device_type": device_type,
                 "device_id": device_id,
@@ -424,6 +442,8 @@ class Mapper:
                         value = None
 
                 mapped_values[alias] = {
+                    # Preserve the complete model metadata alongside live values.
+                    **mapping,
                     "block": block,
                     "device_type": device_type,
                     "device_id": device_id,

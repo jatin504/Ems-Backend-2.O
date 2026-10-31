@@ -1,12 +1,13 @@
 from quart import Quart
-from quart_cors import cors
 from dotenv import load_dotenv
 from app.routes.stream_routes import stream_bp
+from app.routes.v2 import v2_bp
 from app.routes.latest_routes import latest_bp
 from app.routes.history_routes import history_bp
 from app.routes.audit_routes import audit_bp
 from app.routes.strategy_routes import strategy_bp
 from app.routes.get_timeseries_data import timeseries_bp
+from app.routes.raw_data_routes import raw_data_bp
 from app.routes.target_id_key_history_routes import target_id_key_history_bp
 from app.routes.current_strategy_routes import current_strategy
 from app.routes.strategy_configuration_api import strategy_configuration_bp
@@ -81,6 +82,8 @@ from app.routes.notification_routes import notification_bp
 from app.routes.twin_schedule_execute import twin_schedule_exec_bp
 
 from app.middleware.compress_response import compress_response
+from app.middleware.api_scaling import configure_api_scaling
+from app.middleware.cors_config import configure_cors
 import logging
 import os
 import json
@@ -103,10 +106,11 @@ logging.basicConfig(
 
 def create_app():
     app = Quart(__name__)
+    configure_api_scaling(app)
     # Enable compression
     # compress_response(app)
 
-    cors(app, allow_origin="*", allow_headers=["*", "X-Internal-API-Key"], allow_methods=["GET", "POST", "WEBSOCKET"], allow_credentials=False,)
+    configure_cors(app)
 
     @app.route("/ping")
     async def health():
@@ -117,6 +121,7 @@ def create_app():
 
     app.broadcaster = broadcaster
     app.register_blueprint(stream_bp, url_prefix="/stream")
+    app.register_blueprint(v2_bp)
     app.register_blueprint(latest_bp, url_prefix="/latest")
     app.register_blueprint(history_bp, url_prefix="/history")
     app.register_blueprint(target_id_key_history_bp, url_prefix="/target_id_key_history")
@@ -161,6 +166,8 @@ def create_app():
 
     # Time series
     app.register_blueprint(timeseries_bp)
+    # Raw history has its own endpoint
+    app.register_blueprint(raw_data_bp)
 
     # Energy Strategy Routes
     app.register_blueprint(strategy_bp)
@@ -233,6 +240,7 @@ def create_app():
     async def startup():
         # await broadcaster.start()
         await broadcaster.start_cleanup_task()
-        await warm_up_db_connection()
+        # Read workers must not write the shared status JSON during startup.
+        await warm_up_db_connection(write_health_flag=app.config["EMS_API_ROLE"] == "primary")
 
     return app, broadcaster

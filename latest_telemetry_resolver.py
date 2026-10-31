@@ -1,24 +1,19 @@
-import json
-from pathlib import Path
-
 from runtime_paths import DataPaths
+from utils.telemetry_store import TelemetryStore
+
 
 class LatestTelemetryResolver:
     def __init__(self, base_dir="latest_telemetry"):
+        # The selected store preserves JSON as the default architecture.
         self.base_dir = DataPaths.resolve(base_dir)
+        self.store = TelemetryStore("mapped", self.base_dir)
 
     def get_latest_device_data(self, device_id: str) -> dict:
-        """
-        Read and return latest telemetry data (including original registers) 
-        from latest_telemetry/<device_id>.json
-        """
-        file_path = self.base_dir / f"{device_id}.json"
-
-        if not file_path.exists():
-            return {"error": f"{device_id}.json not found"}
-
+        """Read mapped tags from JSON or Valkey while retaining the error envelope."""
         try:
-            with open(file_path, "r") as f:
-                return json.load(f)["data"]
-        except Exception as e:
-            return {"error": f"Failed to read {device_id}.json: {e}"}
+            # Mapped-stage reader: JSON/Valkey selection belongs to TelemetryStore.
+            # Missing data retains this resolver's existing error-response shape.
+            data = self.store.read(device_id)
+            return data if data is not None else {"error": f"No mapped telemetry for {device_id}"}
+        except Exception:
+            return {"error": f"Failed to read telemetry for {device_id}"}
