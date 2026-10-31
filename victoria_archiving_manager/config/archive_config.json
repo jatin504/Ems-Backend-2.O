@@ -1,5 +1,5 @@
 {
-  "_comment": "Configurable Archiving & Retention Policy Configuration for BESS EMS Historian (VictoriaMetrics)",
+  "_comment": "BESS historian policy tiers: critical 1-second data for 3 months, 1-minute for 1 year, 5-minute for 5 years, and 15-minute for 12 years. Day-based approximations are used; the archive manager operates on monthly partitions. This config does not implement backups, legal holds, or event-record retention.",
 
   "partition_label": "record_month",
   "resolution_label": "resolution",
@@ -14,28 +14,28 @@
   "tiers": [
     {
       "name": "raw_1s",
-      "description": "1-second critical data",
+      "description": "Critical 1-second data; 3 months approximated as 90 days, with no additional safety buffer",
       "resolution": "raw_1_sec",
       "retention_days": 90,
       "enabled": true
     },
     {
       "name": "raw_1m",
-      "description": "1-Minute Raw EMS Metrics (Archived & Purged after 1 year + 1 month buffer)",
+      "description": "1-minute EMS metrics; 1 year approximated as 365 days, with no additional safety buffer",
       "resolution": "1_min",
       "retention_days": 365,
       "enabled": true
     },
     {
       "name": "rollup_5m",
-      "description": "5-Minute Aggregated Metrics (Archived & Purged after 5 years + 1 month buffer)",
+      "description": "5-minute aggregated metrics; 5 years approximated as 1825 days, with no additional safety buffer",
       "resolution": "5m",
       "retention_days": 1825,
       "enabled": true
     },
     {
       "name": "rollup_15m",
-      "description": "15-Minute Aggregated Metrics (Archived & Purged after 12 years + 1 month buffer)",
+      "description": "15-minute aggregated metrics; 12 years approximated as 4380 days, with no additional safety buffer",
       "resolution": "15m",
       "retention_days": 4380,
       "enabled": true
