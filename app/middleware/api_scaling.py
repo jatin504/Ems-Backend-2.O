@@ -4,10 +4,10 @@ import logging
 import os
 from pathlib import Path
 
+import asyncpg
 from quart import g, jsonify, request
 
 from api_scaling import replica_allowed
-from app.utils.db_utils import DB
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,26 @@ def configure_api_scaling(app):
     instance = os.getenv("EMS_API_INSTANCE", "api1")
     app.config["EMS_API_ROLE"] = role
     mutation_lock = asyncio.Lock()
+    readiness_pool = None
+
+    @app.before_serving
+    async def start_readiness_pool():
+        nonlocal readiness_pool
+        # Reserve at most one connection per worker for probes. Request-pool
+        # saturation must not evict a healthy worker from every proxy backend.
+        # min_size=0 lets the API start while PostgreSQL is unavailable.
+        readiness_pool = await asyncpg.create_pool(
+            **app.db_config, min_size=0, max_size=1,
+            timeout=3, command_timeout=3,
+        )
+
+    @app.after_serving
+    async def stop_readiness_pool():
+        if readiness_pool is not None:
+            try:
+                await asyncio.wait_for(readiness_pool.close(), timeout=2)
+            except asyncio.TimeoutError:
+                readiness_pool.terminate()
 
     @app.before_request
     async def restrict_replica():
@@ -62,10 +82,12 @@ def configure_api_scaling(app):
                 raise RuntimeError("Required EMS data/config is unavailable")
 
             async def check_db():
-                async with DB() as db:
-                    await db.fetch("SELECT 1")
+                if readiness_pool is None:
+                    raise RuntimeError("Readiness pool has not started")
+                async with readiness_pool.acquire(timeout=3) as connection:
+                    await connection.fetchval("SELECT 1", timeout=3)
 
-            await asyncio.wait_for(check_db(), timeout=2)
+            await asyncio.wait_for(check_db(), timeout=3)
         except Exception:
             logger.warning("API readiness failed", exc_info=True)
             return jsonify(status="NOT_READY", instance=instance), 503

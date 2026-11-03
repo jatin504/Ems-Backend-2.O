@@ -62,7 +62,7 @@ def render_haproxy(config):
         "    ssl-default-bind-options ssl-min-ver TLSv1.2",
         "    hard-stop-after 30s", "",
         "defaults", "    mode http", "    log global", "    option httplog",
-        "    timeout connect 3s", "    timeout check 3s",
+        "    timeout connect 3s", "    timeout check 4s",
         "    timeout queue 10s", "    timeout http-request 15s",
         "    timeout http-keep-alive 10s", "    timeout client 1h",
         "    timeout server 60s", "    timeout tunnel 1h", "",
