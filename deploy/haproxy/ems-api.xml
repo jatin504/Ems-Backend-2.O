@@ -1,0 +1,19 @@
+<!-- WinSW service definition. Place beside a verified WinSW binary named
+     ems-api.exe. Replace paths; configure a dedicated service account and
+     restrictive directory ACLs before installation. -->
+<service>
+  <id>ems-api</id>
+  <name>EMS Quart API</name>
+  <description>EMS API supervisor; instance count comes from cluster.json.</description>
+  <executable>C:\EMS\.venv\Scripts\python.exe</executable>
+  <arguments>-u C:\EMS\run_api_cluster.py</arguments>
+  <workingdirectory>C:\EMS</workingdirectory>
+  <startmode>Automatic</startmode>
+  <stoptimeout>45 sec</stoptimeout>
+  <onfailure action="restart" delay="5 sec" />
+  <logpath>C:\EMS\service-logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>
