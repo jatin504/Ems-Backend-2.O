@@ -127,8 +127,18 @@ def calculate_poa(dt: datetime, peak_poa: float = 1000.0) -> float:
     # Base smooth solar curve
     base_poa = peak_poa * math.sin(math.pi * progress)
 
-    # Increase variation from 10:00 to 15:00
-    if 9 <= dt.hour < 15:
+    dip_start = 12 * 60 + 4
+    dip_bottom = dip_start + 3
+    recovery_end = dip_bottom + 2
+    if dip_start <= current_minutes <= recovery_end:
+        start_progress = (dip_start - start_minutes) / (sunset_minutes - start_minutes)
+        start_poa = peak_poa * math.sin(math.pi * start_progress)
+        dropped_poa = start_poa * 0.75
+        if current_minutes <= dip_bottom:
+            poa = start_poa - dropped_poa * (current_minutes - dip_start) / 3
+        else:
+            poa = start_poa - dropped_poa + dropped_poa * 0.65 * (current_minutes - dip_bottom) / 2
+    elif 9 <= dt.hour < 15:
         variation = random.uniform(-50, 50)
         poa = base_poa + variation
     else:
