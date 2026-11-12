@@ -17,8 +17,9 @@ class AlarmSampling:
         self.last_processed_time = defaultdict(dict)  # Tracks last processed time for ResolutionAlarm
         self.alarm_resolver = PlantArchitectureResolver()
         self.enum_alarms = ENUM_ALARMS
+        self.debounce_candidates = {}  # (device, tag) -> (value, since, latest)
         
-    async def add_data(self, device_id, tag, value, timestamp, change=True, resolution=60, alarmType="normal", bitMapAlarm={}, severity="critical", isNormalReverse=False, customInfos=None):
+    async def add_data(self, device_id, tag, value, timestamp, change=True, resolution=60, alarmType="normal", bitMapAlarm={}, severity="critical", isNormalReverse=False, customInfos=None, is_debounce=False, debounce_time=4):
         """
         Add data for an alarm tag.
         :param device_id: The device ID.
@@ -28,6 +29,31 @@ class AlarmSampling:
         :param change: Whether to log only on change (True) or based on resolution (False).
         :param resolution: The resolution period in seconds (used if change is False).
         """
+        key = (device_id, tag)
+        if is_debounce:
+            try:
+                duration = float(debounce_time)
+                if not 0 < duration < float("inf"):
+                    raise ValueError("duration must be positive and finite")
+            except (TypeError, ValueError):
+                logger.error("Invalid debounce_time for %s:%s: %r", device_id, tag, debounce_time)
+                return
+            candidate = self.debounce_candidates.get(key)
+            if value is None:
+                self.debounce_candidates.pop(key, None)
+                return
+            if candidate is not None and timestamp < candidate[2]:
+                return  # Ignore out-of-order samples.
+            if candidate is None or value != candidate[0]:
+                self.debounce_candidates[key] = (value, timestamp, timestamp)
+                return
+            self.debounce_candidates[key] = (value, candidate[1], timestamp)
+            if timestamp - candidate[1] < duration:
+                return
+            # Debounced alarms are state transitions, including when change=False.
+            await self._process_change_based(device_id, tag, value, severity, isNormalReverse, timestamp, alarmType, bitMapAlarm)
+            return
+        self.debounce_candidates.pop(key, None)
         if alarmType == "custom":
             self._process_custom_based(device_id, tag, value, timestamp, customInfos)
         elif change:
@@ -316,7 +342,7 @@ class AlarmSampling:
                         row["remark"]
                     ))
                     conn.commit()
-                    print(f"✔ Alarm inserted: {row}")
+                    logger.info("Alarm inserted: %s", row)
 
         except Exception as e:
             logger.error(f"❌ Failed to insert alarm into DB: {e}")

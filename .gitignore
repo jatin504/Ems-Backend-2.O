@@ -6,3 +6,14 @@ __pycache__/*
 
 # Runtime device cache
 sampled_device_cache/
+# Local Valkey tests, demos, reports and scratch files
+/do-not-merge/
+
+# Runtime files created by the approved standalone historian tools
+/victoria_archiving_manager/archives/
+/victoria_archiving_manager/logs/
+/vmalert_rule_generator/output/
+
+# Generated local API cluster deployment artifacts
+/deploy/haproxy/generated.cfg
+/deploy/haproxy/cluster.lock

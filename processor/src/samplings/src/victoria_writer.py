@@ -6,6 +6,7 @@ import time
 import logging
 import os
 from datetime import datetime
+from utils.historian_common import record_month
 
 from utils.db_config import db_config
 from utils.db_write_queue import VICTORIA_DB_WRITE_QUEUE
@@ -97,7 +98,9 @@ class VictoriaWriter:
 
                 line = (
                     f'{metric_name}'
-                    f'{{device="{device_id}",database="{DB_NAME}",resolution="1_min"}}'
+                    # Partition by actual sample time; month-scoped delete cannot
+                    # remove a device's newer samples in another month.
+                    f'{{device="{device_id}",database="{DB_NAME}",resolution="1_min",record_month="{record_month(timestamp)}"}}'
                     f'{value} {timestamp}'
                 )
 

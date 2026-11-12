@@ -49,7 +49,7 @@ def _sync_post_forecast(url: str, payload: dict) -> dict:
         data=data,
         headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=120) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -127,8 +127,18 @@ def calculate_poa(dt: datetime, peak_poa: float = 1000.0) -> float:
     # Base smooth solar curve
     base_poa = peak_poa * math.sin(math.pi * progress)
 
-    # Increase variation from 10:00 to 15:00
-    if 9 <= dt.hour < 15:
+    dip_start = 12 * 60 + 4
+    dip_bottom = dip_start + 3
+    recovery_end = dip_bottom + 2
+    if dip_start <= current_minutes <= recovery_end:
+        start_progress = (dip_start - start_minutes) / (sunset_minutes - start_minutes)
+        start_poa = peak_poa * math.sin(math.pi * start_progress)
+        dropped_poa = start_poa * 0.75
+        if current_minutes <= dip_bottom:
+            poa = start_poa - dropped_poa * (current_minutes - dip_start) / 3
+        else:
+            poa = start_poa - dropped_poa + dropped_poa * 0.65 * (current_minutes - dip_bottom) / 2
+    elif 9 <= dt.hour < 15:
         variation = random.uniform(-50, 50)
         poa = base_poa + variation
     else:
@@ -137,14 +147,7 @@ def calculate_poa(dt: datetime, peak_poa: float = 1000.0) -> float:
     return round(max(0.0, min(poa, peak_poa)), 2)
 
 
-def build_and_save_sample_window_json(forecast_points: list) -> str:
-    """
-    Transforms forecast points into the exact sample_window structure and
-    saves it locally on EMS Backend disk using the path configured in .env.
-    """
-    if not forecast_points:
-        return ""
-
+def build_sample_window(forecast_points: list) -> list:
     sample_records = []
     for p in forecast_points:
         ts_str = p.get("timestamp")
@@ -171,11 +174,23 @@ def build_and_save_sample_window_json(forecast_points: list) -> str:
             "poa": poa,
             "co_relation_percent": correlation,
             "load_state": state,
-            "grid_import_limit_kw": 4000,
+            "grid_import_limit_kw": (
+                1000 if dt.hour == 10 else 4000
+            ),
             "tariff_per_kw": tariff,
             "time_stamp": dt.strftime("%Y-%m-%d %H:%M:%S")
         })
 
+    return sample_records
+
+
+def build_and_save_sample_window_json(forecast_points: list) -> str:
+    return save_sample_window_json(build_sample_window(forecast_points))
+
+
+def save_sample_window_json(sample_records: list) -> str:
+    if not sample_records:
+        return ""
     sample_window_path = os.getenv("SAMPLE_WINDOW_JSON_PATH", "data/sample_window_forecast.json")
     try:
         os.makedirs(os.path.dirname(os.path.abspath(sample_window_path)), exist_ok=True)
@@ -215,13 +230,18 @@ async def call_forecast_service(model_name: str = "model_clean", input_file: str
         raise
 
 
-async def save_forecast_to_db(forecast_list: list, model_name: str = "model_clean") -> int:
+async def save_forecast_to_db(forecast_list: list, model_name: str = "model_clean", *, db=None) -> int:
     """
     Saves or updates forecast points into the PostgreSQL `load_forecast` table.
     Uses UPSERT so repeated calls update values cleanly without creating duplicates.
     """
     if not forecast_list:
         return 0
+
+    if db is None:
+        async with DB() as connection:
+            await ensure_load_forecast_table(connection)
+            return await save_forecast_to_db(forecast_list, model_name, db=connection)
 
     records = []
     for item in forecast_list:
@@ -251,9 +271,7 @@ async def save_forecast_to_db(forecast_list: list, model_name: str = "model_clea
             forecast_date = EXCLUDED.forecast_date,
             created_at = NOW()
     """
-    async with DB() as db:
-        await ensure_load_forecast_table(db)
-        await db.connection.executemany(insert_query, records)
+    await db.connection.executemany(insert_query, records)
 
     logger.info("Saved/updated %d records into PostgreSQL table 'load_forecast'.", len(records))
     return len(records)

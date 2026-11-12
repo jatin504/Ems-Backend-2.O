@@ -293,9 +293,15 @@ class ResolutionSampling:
 
                 if batch:
                     # await DB_WRITE_QUEUE.put(batch)
+                    # Historical output: the Victoria worker consumes this queue.
+                    # Queueing a batch is not confirmation of a database insert.
                     await VICTORIA_DB_WRITE_QUEUE.put(batch)
 
-                    # Push to plant architecture -- mandate 
+                    # SECOND CACHE ENTRY POINT (after sampling): store latest avg/last
+                    # values via update_block_devices -> update_device_cache -> merge.
+                    # JSON uses sampled_telemetry/<device_id>.json; Valkey uses
+                    # <prefix>:sampled:<device_id>. History above is independent.
+                    # The legacy name does not mean rewriting plant metadata JSON.
                     await self.device_resolver.update_block_devices(batch=batch)
                     # self.device_resolver.update_device_files(
                     #     batch=batch

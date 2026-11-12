@@ -133,6 +133,8 @@ class SamplingManager:
                     
                     else:
                         await self.sampling_strategies["alarm"].add_data(
+                            is_debounce=tag_config.get("is_debounce", False) is True,
+                            debounce_time=tag_config.get("debounce_time", 4),
                             device_id=device_id,
                             tag=alias,
                             value=value,
