@@ -1,6 +1,7 @@
 from quart import Quart
 from dotenv import load_dotenv
 from app.routes.stream_routes import stream_bp
+from app.routes.live_log_routes import live_logs_bp, serve_live_logs
 from app.routes.v2 import v2_bp
 from app.routes.latest_routes import latest_bp
 from app.routes.history_routes import history_bp
@@ -121,6 +122,8 @@ def create_app():
 
     app.broadcaster = broadcaster
     app.register_blueprint(stream_bp, url_prefix="/stream")
+    app.register_blueprint(live_logs_bp)
+    app.while_serving(serve_live_logs)
     app.register_blueprint(v2_bp)
     app.register_blueprint(latest_bp, url_prefix="/latest")
     app.register_blueprint(history_bp, url_prefix="/history")
