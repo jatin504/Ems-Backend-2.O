@@ -1,7 +1,5 @@
-import json
 import logging
 from datetime import datetime, date, timedelta
-from pathlib import Path
 from config.device_config_resolver import DeviceConfigResolver
 from controller_layer.strategies.classes.schedule_strategy import ScheduleStrategy
 from quart import Blueprint, request, jsonify
@@ -11,23 +9,28 @@ from app.services.load_forecast_services import (
     get_forecast_from_db,
     get_combined_load_and_schedule,
     build_and_save_sample_window_json,
+    build_sample_window,
+    save_sample_window_json,
+)
+from app.services.provisional_schedule_service import (
+    delete_forecast_and_provisional_schedule,
+    get_provisional_schedule,
+    save_provisional_schedule,
 )
 
 logger = logging.getLogger(__name__)
 
 load_forecast_bp = Blueprint("load_forecast_bp", __name__)
 
+
 # =====================================================================
 # COMBINED ENDPOINT: Load Forecast + Strategy Schedule (1 Single API)
 # =====================================================================
-@load_forecast_bp.route("/api/load-schedule", methods=["GET", "POST"])
-@load_forecast_bp.route("/api/load-and-schedule", methods=["GET", "POST"])
-@load_forecast_bp.route("/api/forecast-schedule", methods=["GET", "POST"])
 @load_forecast_bp.route("/api/load-forecast-schedule", methods=["GET", "POST"])
 async def get_load_and_schedule():
     """
-    Unified single API endpoint returning BOTH Load Forecast and Strategy Schedule.
-    Designed specifically for the single UI widget ("Load vs BESS Schedule").
+    Run the forecast on an unfiltered request and return today's and tomorrow's saved plan.
+    A date or day filter reads saved rows. force_refresh also runs the model with a filter.
 
     Query Params / JSON Body:
       - filter: "today", "tomorrow" / "next_day", "all"
@@ -38,8 +41,8 @@ async def get_load_and_schedule():
 
     Response contains:
       - forecast: raw load forecast points list
-      - schedule: raw energy strategy schedules list
-      - chart_series: Highcharts-ready series for load_forecast, charge, discharge
+      - schedule: minute-wise provisional schedule rows
+      - chart_series: timestamped provisional values
       - summary: total_charge_kwh, total_discharge_kwh, net_discharge_kwh, peak_load_kw
     """
     try:
@@ -64,26 +67,80 @@ async def get_load_and_schedule():
             except ValueError:
                 return jsonify({"error": "Invalid date format, expected YYYY-MM-DD"}), 400
 
-        result = await get_combined_load_and_schedule(
-            target_date=target_date,
-            filter_param=filter_param,
-            force_refresh=force_refresh,
-            input_file=input_file,
-            model_name=model_name
-        )
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        filter_param = (filter_param or "all").lower()
+        if target_date is None:
+            if filter_param == "today":
+                target_date = today
+            elif filter_param in ("tomorrow", "next_day"):
+                target_date = tomorrow
+            elif filter_param != "all":
+                return jsonify({"error": "Invalid filter, expected today, tomorrow or all"}), 400
 
-        result_file = Path("data/sample_window_forecast.json")
-        with result_file.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        device_resolver = DeviceConfigResolver()
-        strategy = ScheduleStrategy(resolver=device_resolver, sample_data=data)
+        source = "ems_database"
+        sample_path = None
+        if force_refresh or target_date is None:
+            try:
+                forecast_data = await call_forecast_service(model_name=model_name, input_file=input_file)
+            except ConnectionError as error:
+                logger.warning("Forecast service unavailable: %s", error)
+                source = "ems_database_fallback"
+            else:
+                points = forecast_data.get("forecast", [])
+                samples = build_sample_window(points)
+                if samples:
+                    sample_path = save_sample_window_json(samples)
+                    if not sample_path:
+                        raise OSError("Could not save sample window forecast")
+                    strategy = ScheduleStrategy(resolver=DeviceConfigResolver(), sample_data=samples)
+                    schedule = await strategy.prepare_ems_plan_schedule()
+                    await save_provisional_schedule(points, samples, schedule, model_name)
+                    source = "forecast_microservice"
 
-        await strategy.prepare_ems_plan_schedule()
+        first_day = target_date or today
+        last_day = target_date or tomorrow
+        forecast = await get_forecast_from_db(target_date=first_day, model_name=model_name)
+        if first_day != last_day:
+            forecast += await get_forecast_from_db(target_date=last_day, model_name=model_name)
+        schedule = await get_provisional_schedule(first_day, last_day, model_name)
 
-        logger.info("SCHEDULE PREPARED.........")
+        columns = {
+            "load_forecast": "forecast_load_kw",
+            "poa": "poa",
+            "pv": "pv_kw",
+            "grid_charge": "grid_charge_kw",
+            "discharge": "discharge_kw",
+            "bess_power": "bess_power_kw",
+            "grid_import": "grid_import_kw",
+        }
+        chart_series = {name: [] for name in (*columns, "charge")}
+        for row in schedule:
+            timestamp = int(datetime.fromisoformat(row["target_ts"]).timestamp() * 1000)
+            for name, column in columns.items():
+                chart_series[name].append([timestamp, row[column]])
+            chart_series["charge"].append([timestamp, round(row["charge_kw"] + row["grid_charge_kw"], 2)])
 
-        return jsonify(result), 200
+        charge_kwh = sum(value for _, value in chart_series["charge"]) / 60
+        discharge_kwh = sum(value for _, value in chart_series["discharge"]) / 60
+        return jsonify({
+            "status": "success",
+            "date": target_date.isoformat() if target_date else "all",
+            "filter": filter_param,
+            "source": source,
+            "sample_window_json_path": sample_path,
+            "forecast": forecast,
+            "schedule": schedule,
+            "chart_series": chart_series,
+            "summary": {
+                "total_forecast_points": len(forecast),
+                "total_schedules": len(schedule),
+                "total_charge_kwh": round(charge_kwh, 2),
+                "total_discharge_kwh": round(discharge_kwh, 2),
+                "net_discharge_kwh": round(discharge_kwh - charge_kwh, 2),
+                "peak_load_kw": max((row["forecast_load_kw"] for row in schedule), default=0.0),
+            },
+        }), 200
 
     except Exception as e:
         logger.exception("Unexpected error in /api/load-and-schedule: %s", e)
@@ -91,6 +148,25 @@ async def get_load_and_schedule():
             "status": "error",
             "message": str(e)
         }), 500
+
+
+@load_forecast_bp.route("/api/provisional-schedule/delete", methods=["POST"])
+async def delete_schedule_for_date():
+    body = await request.get_json(silent=True) or {}
+    value = request.args.get("date") or (body.get("date") if isinstance(body, dict) else None)
+    try:
+        target_date = date.fromisoformat(value)
+        if value != target_date.isoformat():
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "Pass date in YYYY-MM-DD format"}), 400
+
+    forecasts, schedules = await delete_forecast_and_provisional_schedule(target_date)
+    return jsonify({
+        "date": target_date.isoformat(),
+        "deleted_load_forecast_rows": forecasts,
+        "deleted_provisional_schedule_rows": schedules,
+    }), 200
 
 
 # =====================================================================

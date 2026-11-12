@@ -1572,6 +1572,8 @@ class ScheduleStrategy:
             f"[EVENT GENERATOR] Fresh schedule written to {self.result_file}"
         )
 
+        return schedule
+
     async def execute(
         self,
         channel,

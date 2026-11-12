@@ -126,6 +126,24 @@ def create_application_schema():
 
         cursor.execute("ALTER TABLE energy_strategy ADD COLUMN IF NOT EXISTS state TEXT;")
 
+        # ---------------- provisional_schedule ----------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS provisional_schedule (
+            target_ts TIMESTAMP NOT NULL,
+            model_name TEXT NOT NULL,
+            poa DOUBLE PRECISION NOT NULL,
+            pv_kw DOUBLE PRECISION NOT NULL,
+            forecast_load_kw DOUBLE PRECISION NOT NULL,
+            charge_kw DOUBLE PRECISION NOT NULL,
+            grid_charge_kw DOUBLE PRECISION NOT NULL,
+            discharge_kw DOUBLE PRECISION NOT NULL,
+            bess_mode TEXT NOT NULL,
+            bess_power_kw DOUBLE PRECISION NOT NULL,
+            grid_import_kw DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (target_ts, model_name)
+        );
+        """)
+
         # -------------------- notifications for EMS ------------------
         cursor.execute("""
             CREATE TABLE notification_event (
