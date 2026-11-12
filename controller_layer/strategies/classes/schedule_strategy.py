@@ -6,7 +6,7 @@ import logging
 from controller_layer.authority.authority_manager import AuthorityManager
 # from controller_layer.strategies.classes.common.ScheduleStrategy import bess_decision as bess_decision7
 from controller_layer.cloud_detection.detect import CloudDetection
-from controller_layer.scheduler.bess_scheduler import BESScheduler
+from controller_layer.scheduler.bess_scheduler import BESScheduler, BESSchedulerEnergyAvailability
 from controller_layer.strategies.grif_forming_following_control import gfl_gfm_mode_selection, smart_mode_controller
 from controller_layer.strategies.tags import FaultCode, Tags
 from model.models import EnergyStrategy, NotificationEvent, SetpointWrite
@@ -1511,9 +1511,126 @@ class ScheduleStrategy:
         self.result_file = Path("D:/New folder/ems_backend_data/schedule_strategy/result.json")
 
         self.bess_scheduler = BESScheduler()
+        # self.bess_scheduler = BESSchedulerEnergyAvailability()
         self.sample_window = self.bess_scheduler.aggregate_to_15min(sample_data if sample_data else self.sample_window_1min)
 
         self.schedule = None
+
+        self.running_event_id = "none"
+
+        self.FAULT_SUSTAIN_SECONDS = 3
+
+        self._base_load_kw = 0.0
+        self._load_reduction_kw = 0.0
+        self.reduction_step_kw = 0.50
+        self.reduction_step_delay = 5
+
+        self._load_lock = asyncio.Lock()
+
+        self._reduction_queue = asyncio.Queue()
+        self._reduction_worker_task = None
+
+        self._background_tasks = set()
+
+        self.peak_load = 4000.0 # kW
+        self.carry_capacity = self.peak_load * (1 + 0.2)  # kW
+
+        self.load_sharing_percentage = {
+            "EV1": 25.0,
+            "EV2": 25.0,
+            "CHILLER1": 15.0,
+            "CHILLER2": 15.0,
+            "COOLING_TOWER1": 5.0,
+            "COOLING_TOWER2": 5.0,
+            "SERVICE_BLOCK": 10.0,
+        }
+
+        self.load_reduction_priority = [
+            "EV1",
+            "EV2",
+            "CHILLER1",
+            "CHILLER2",
+            "COOLING_TOWER1",
+            "COOLING_TOWER2",
+            "SERVICE_BLOCK",
+        ]
+
+        # Live operational load values
+        self.load_blocks = {
+            block: 0.0
+            for block in self.load_sharing_percentage
+        }
+
+    
+    def _initialize_load_blocks(self, total_load_kw):
+
+        self.load_blocks = {
+            block: total_load_kw * percentage / 100.0
+            for block, percentage in self.load_sharing_percentage.items()
+        }
+
+        logger.info(
+            f"[LOAD DISTRIBUTION] Initial block loads: "
+            f"{self.load_blocks}"
+        )
+
+
+    def _track_background_task(self, task):
+        self._background_tasks.add(task)
+
+        task.add_done_callback(
+            self._background_tasks.discard
+        )
+
+        return task
+
+    async def _cancel_background_tasks(self):
+
+        tasks = set(self._background_tasks)
+
+        if self._reduction_worker_task is not None:
+            if not self._reduction_worker_task.done():
+                tasks.add(self._reduction_worker_task)
+
+        if not tasks:
+            logger.info("[CLEANUP] No background tasks to cancel.")
+            return
+
+        logger.info(
+            "[CLEANUP] Cancelling %d background tasks...",
+            len(tasks),
+        )
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                logger.error(
+                    "[CLEANUP] Background task ended with error: %s",
+                    result,
+                )
+
+        self._background_tasks.clear()
+        self._reduction_worker_task = None
+
+        logger.info(
+            "[CLEANUP] All background tasks stopped."
+        )
+
+    async def stop(self):
+        """
+        Stop all background and reduction tasks.
+        """
+        await self._cancel_background_tasks()
     
     async def prepare_plan_schedule(self):
 
@@ -1639,26 +1756,62 @@ class ScheduleStrategy:
                 # 1. START 1-MINUTE LOAD PROFILE
                 # -------------------------------------------------
 
-                load_task = asyncio.create_task(
-                    self._execute_window_load(
-                        window_load=window_load,
-                        channel=channel,
-                        server_ip=server_ip,
-                        server_port=server_port,
-                        slave_id=slave_id,
-                        device_id=device_id,
+                # load_task = asyncio.create_task(
+                #     self._execute_window_load(
+                #         window_load=window_load,
+                #         channel=channel,
+                #         server_ip=server_ip,
+                #         server_port=server_port,
+                #         slave_id=slave_id,
+                #         device_id=device_id,
+                #     )
+                # )
+
+                # pv_task = asyncio.create_task(
+                #     self._execute_window_pv(
+                #         window_pv=pv_window,
+                #         window_poa=poa_window,
+                #         channel=channel,
+                #         server_ip=server_ip,
+                #         server_port=server_port,
+                #         slave_id=slave_id,
+                #         device_id=device_id,
+                #     )
+                # )
+                self.load_blocks = {
+                    "EV1": 350.0,
+                    "EV2": 350.0,
+                    "CHILLER1": 250.0,
+                    "CHILLER2": 250.0,
+                    "COOLING_TOWER1": 150.0,
+                    "COOLING_TOWER2": 150.0,
+                    "SERVICE_BLOCK": 500.0,
+                }
+
+                load_task = self._track_background_task(
+                    asyncio.create_task(
+                        self._execute_window_load(
+                            window_load=window_load,
+                            channel=channel,
+                            server_ip=server_ip,
+                            server_port=server_port,
+                            slave_id=slave_id,
+                            device_id=device_id,
+                        )
                     )
                 )
 
-                pv_task = asyncio.create_task(
-                    self._execute_window_pv(
-                        window_pv=pv_window,
-                        window_poa=poa_window,
-                        channel=channel,
-                        server_ip=server_ip,
-                        server_port=server_port,
-                        slave_id=slave_id,
-                        device_id=device_id,
+                pv_task = self._track_background_task(
+                    asyncio.create_task(
+                        self._execute_window_pv(
+                            window_pv=pv_window,
+                            window_poa=poa_window,
+                            channel=channel,
+                            server_ip=server_ip,
+                            server_port=server_port,
+                            slave_id=slave_id,
+                            device_id=device_id,
+                        )
                     )
                 )
 
@@ -1679,6 +1832,7 @@ class ScheduleStrategy:
                     data = json.load(f)
 
                 data["running_event_id"] = event["event_id"]
+                self.running_event_id = event["event_id"]
                 # data["running_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 with self.result_file.open("w", encoding="utf-8") as f:
@@ -1826,12 +1980,32 @@ class ScheduleStrategy:
             return results
         
         except asyncio.CancelledError:
-            logger.info("Schedule strategy stopping.")
 
-            # Perform any necessary cleanup here.
-            # For example, release resources or close connections.
+            logger.warning(
+                "[SCHEDULE] Schedule execution cancellation received."
+            )
 
             raise
+
+        except Exception:
+
+            logger.exception(
+                "[SCHEDULE] Schedule execution failed."
+            )
+
+            raise
+
+        finally:
+
+            logger.info(
+                "[SCHEDULE] Cleaning up background ingestion tasks."
+            )
+
+            await self._cancel_background_tasks()
+
+            logger.info(
+                "[SCHEDULE] Schedule execution cleanup completed."
+            )
 
     async def event_execute(
         self,
@@ -2458,19 +2632,44 @@ class ScheduleStrategy:
             logger.info(
                 f"{LogColor.CYAN}"
                 f"Schedule event = {decision}. "
-                f"No BESS action required."
+                f"No BESS action required. But monitoring continues.. incase of disturption of load BESS Required !"
+                f"IDLE -> DISCHARGING LOOP"
                 f"{LogColor.RESET}"
             )
 
-            return {
-                "status": "no_action",
-                "decision": decision,
-                "message": "No BESS action required.",
-                "grid_power_kw": grid_power,
-                "load_kw": current_load_kw,
-                "pv_kw": pv_power_kw,
-                "soc_percent": soc,
-            }
+            # return {
+            #     "status": "no_action",
+            #     "decision": decision,
+            #     "message": "No BESS action required.",
+            #     "grid_power_kw": grid_power,
+            #     "load_kw": current_load_kw,
+            #     "pv_kw": pv_power_kw,
+            #     "soc_percent": soc,
+            # }
+
+            result = await self.PeakShavingDischargeStrategyType7(
+                resolver=self.resolver,
+                controller_static=self.controller_static,
+                server_ip=server_ip,
+                server_port=server_port,
+                channel=channel,
+                slave_id=slave_id,
+                device_id=device_id,
+                excess_load=0.0,
+                target_limit=0.0,
+                poi_meter_id=poi_meter_id,
+                event=event,
+                extra_info={
+                    "strategy_id": 7,
+                },
+                # extra_info={
+                #     "force_hard": force_hard,
+                #     "event_decision": decision,
+                #     "event": event,
+                # }
+            )
+
+            return result
 
         # =========================================================================
         # 11. UNKNOWN DECISION
@@ -2850,7 +3049,7 @@ class ScheduleStrategy:
 
         return strategy_rec
 
-    async def _execute_window_load(
+    async def prev_execute_window_load(
         self,
         window_load,
         channel,
@@ -2888,6 +3087,419 @@ class ScheduleStrategy:
             if minute_index < len(window_load) - 1:
                 await asyncio.sleep(60)
 
+        
+    def _save_load_shedding_event(self, reduced_kw_by_group):
+
+        try:
+            # Read existing JSON file
+            if self.result_file.exists():
+                with self.result_file.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {}
+
+            # Ensure event list exists
+            if "load_shedding_events" not in data:
+                data["load_shedding_events"] = []
+
+            # Filter actual reductions
+            actual_reductions = {
+                group: round(float(kw), 2)
+                for group, kw in reduced_kw_by_group.items()
+                if kw > 0
+            }
+
+            # Avoid saving empty events
+            if not actual_reductions:
+                logger.info(
+                    "[LOAD SHEDDING EVENT] No actual reduction. "
+                    "Event not saved."
+                )
+                return
+
+            load_groups = list(actual_reductions.keys())
+
+            # Prepare event
+            event = {
+                "event_id": self.running_event_id,
+                "timestamp": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "load_groups": load_groups,
+                "reduced_kw_by_group": actual_reductions,
+                "total_reduction_kw": round(
+                    sum(actual_reductions.values()), 2
+                )
+            }
+
+            # Append event
+            data["load_shedding_events"].append(event)
+
+            # Write updated JSON
+            with self.result_file.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+
+            logger.info(
+                f"[LOAD SHEDDING EVENT] Successfully saved event: "
+                f"{self.running_event_id}"
+            )
+
+            logger.info(
+                f"[LOAD SHEDDING EVENT] Groups={load_groups} | "
+                f"Reduction={actual_reductions} | "
+                f"Total={event['total_reduction_kw']:.2f} kW"
+            )
+
+        except Exception:
+            logger.exception(
+                "[LOAD SHEDDING EVENT] Failed to save load shedding event"
+            )
+    
+   
+    def _calculate_priority_reduction(self, requested_kw):
+
+        remaining_kw = requested_kw
+        changes = {}
+
+        reduced_kw_by_group = {
+            "ev": 0.0,
+            "chiller": 0.0,
+            "cooling_tower": 0.0,
+            "service_block": 0.0
+        }
+
+        logger.info(
+            f"[LOAD REDUCTION] Starting priority reduction | "
+            f"Requested={requested_kw:.2f} kW"
+        )
+
+        for block in self.load_reduction_priority:
+
+            if remaining_kw <= 0:
+                break
+
+            current_kw = self.load_blocks.get(block, 0.0)
+
+            if current_kw <= 0:
+                continue
+
+            reduction_kw = min(
+                current_kw,
+                remaining_kw
+            )
+
+            new_kw = current_kw - reduction_kw
+
+            self.load_blocks[block] = new_kw
+            remaining_kw -= reduction_kw
+
+            if block.startswith("EV"):
+                group = "ev"
+
+            elif block.startswith("CHILLER"):
+                group = "chiller"
+
+            elif block.startswith("COOLING_TOWER"):
+                group = "cooling_tower"
+
+            else:
+                group = "service_block"
+
+            reduced_kw_by_group[group] += reduction_kw
+
+            changes[block] = {
+                "before": current_kw,
+                "reduction": reduction_kw,
+                "after": new_kw
+            }
+
+            logger.info(
+                f"[LOAD REDUCTION] BLOCK={block} | "
+                f"Before={current_kw:.2f} kW | "
+                f"Reduced={reduction_kw:.2f} kW | "
+                f"After={new_kw:.2f} kW"
+            )
+
+        actual_reduction = requested_kw - remaining_kw
+
+        logger.info(
+            f"[LOAD REDUCTION] PRIORITY REDUCTION COMPLETED | "
+            f"Requested={requested_kw:.2f} kW | "
+            f"Applied={actual_reduction:.2f} kW | "
+            f"Remaining={remaining_kw:.2f} kW"
+        )
+
+        return (
+            actual_reduction,
+            changes,
+            remaining_kw,
+            reduced_kw_by_group
+        )
+    
+    
+    async def _process_load_reductions(self):
+
+        while True:
+
+            command = await self._reduction_queue.get()
+
+            try:
+
+                reduction_percentage = command["reduction_percentage"]
+
+                total_reduced_kw_by_group = {
+                    "ev": 0.0,
+                    "chiller": 0.0,
+                    "cooling_tower": 0.0,
+                    "service_block": 0.0
+                }
+
+                logger.info("=" * 80)
+                logger.info(
+                    f"[LOAD REDUCTION] NEW COMMAND | "
+                    f"Requested Reduction={reduction_percentage:.2f}%"
+                )
+                logger.info("=" * 80)
+
+                total_applied_kw = 0.0
+                step_number = 0
+
+                while True:
+
+                    async with self._load_lock:
+
+                        # Always calculate from live block values
+                        current_load = sum(self.load_blocks.values())
+
+                        self.load_kw = current_load
+
+                        # Stop when carrying capacity is reached
+                        if current_load <= self.carry_capacity:
+                            logger.info(
+                                f"[LOAD REDUCTION] Carry capacity reached | "
+                                f"Current={current_load:.2f} kW | "
+                                f"Limit={self.carry_capacity:.2f} kW"
+                            )
+                            break
+
+                        # Calculate percentage reduction from current load
+                        requested_kw = (
+                            current_load * reduction_percentage / 100.0
+                        )
+
+                        # Do not reduce below carrying capacity
+                        available_reduction = (
+                            current_load - self.carry_capacity
+                        )
+
+                        requested_kw = min(
+                            requested_kw,
+                            available_reduction
+                        )
+
+                        if requested_kw <= 0:
+                            break
+
+                        step_number += 1
+
+                        (
+                            actual_reduction,
+                            changes,
+                            remaining_kw,
+                            step_reduced_kw
+                        ) = self._calculate_priority_reduction(
+                            requested_kw
+                        )
+
+                        if actual_reduction <= 0:
+                            logger.warning(
+                                "[LOAD REDUCTION] No further reduction possible."
+                            )
+                            break
+
+                        # Calculate total directly from updated blocks
+                        effective_load = sum(self.load_blocks.values())
+
+                        self.load_kw = effective_load
+                        self._load_reduction_kw += actual_reduction
+
+                        total_applied_kw += actual_reduction
+
+                        # Accumulate event group reductions
+                        for group, kw in step_reduced_kw.items():
+                            total_reduced_kw_by_group[group] += kw
+
+                        logger.info(
+                            f"[LOAD REDUCTION] STEP {step_number} | "
+                            f"Applied={actual_reduction:.2f} kW | "
+                            f"Remaining={remaining_kw:.2f} kW | "
+                            f"Current Load={effective_load:.2f} kW"
+                        )
+
+                        # Write actual individual block loads
+                        await _execute_distributed_load_value_writer(
+                            resolver=self.resolver,
+                            total_load_kw=float(effective_load),
+                            load_blocks=dict(self.load_blocks),
+                            channel_id=command["channel"],
+                            server_ip=command["server_ip"],
+                            server_port=command["server_port"],
+                            slave_id=command["slave_id"],
+                            device_id=command["device_id"],
+                        )
+
+                    await asyncio.sleep(
+                        self.reduction_step_delay
+                    )
+
+                # Save event after completion
+                self._save_load_shedding_event(
+                    total_reduced_kw_by_group
+                )
+
+                logger.info("=" * 80)
+                logger.info(
+                    f"[LOAD REDUCTION] COMMAND COMPLETED | "
+                    f"Applied={total_applied_kw:.2f} kW | "
+                    f"Final Load={self.load_kw:.2f} kW | "
+                    f"Carry Capacity={self.carry_capacity:.2f} kW"
+                )
+                logger.info("=" * 80)
+
+            except Exception:
+
+                logger.exception(
+                    "[LOAD REDUCTION] Error processing reduction command"
+                )
+
+            finally:
+
+                self._reduction_queue.task_done()
+
+    
+    async def reduce_load(
+        self,
+        reduction_percentage,
+        channel,
+        server_ip,
+        server_port,
+        slave_id,
+        device_id,
+    ):
+        """
+        Queue a load reduction command.
+
+        Example:
+            reduction_kw = 500
+
+        The reduction will be applied in 20% steps every 10 seconds.
+        """
+
+        if reduction_percentage <= 0:
+            logger.warning(
+                f"[LOAD REDUCTION] Invalid reduction: {reduction_percentage}"
+            )
+            return
+
+        notification = NotificationEvent(
+            source="EMS",
+            event_type=f"Load Shedding.",
+            severity="INFO",
+            title=f"Load Shedding Initiated.",
+            message=f"Due to {FaultCode(self.fault).name}, load shedding of {reduction_percentage:.2f} % has been initiated.",
+            entity_type="BESS_Schedule",
+            entity_id="BESS_Load Shedding",
+            status="Load-Info",
+            metadata={
+                
+            },
+        )
+
+        pool = await get_async_connection()
+
+        try:
+            async with pool.acquire() as conn:
+                await write_notification_event(conn, notification)
+        finally:
+            await pool.close()
+
+        await self._reduction_queue.put({
+            "reduction_percentage": float(reduction_percentage),
+            "channel": channel,
+            "server_ip": server_ip,
+            "server_port": server_port,
+            "slave_id": slave_id,
+            "device_id": device_id,
+        })
+
+        logger.info(
+            f"[LOAD REDUCTION] Received command: {reduction_percentage:.2f} kW"
+        )
+
+        # Start worker if it is not already running
+        if (
+            self._reduction_worker_task is None
+            or self._reduction_worker_task.done()
+        ):
+            self._reduction_worker_task = asyncio.create_task(
+                self._process_load_reductions()
+            )
+    
+    async def _execute_window_load(
+        self,
+        window_load,
+        channel,
+        server_ip,
+        server_port,
+        slave_id,
+        device_id,
+    ):
+        """
+        Write load profile once every minute.
+
+        Any load reduction command is applied to:
+        1. Current load
+        2. All subsequent load profile values
+        """
+
+        self._load_reduction_kw = 0.0
+
+        for minute_index, load_kw in enumerate(window_load):
+
+            async with self._load_lock:
+
+                self._base_load_kw = float(load_kw)
+
+                effective_load = max(
+                    0.0,
+                    self._base_load_kw - self._load_reduction_kw
+                )
+
+                self.load_kw = effective_load
+                self._initialize_load_blocks(effective_load)
+
+                logger.info(
+                    f"[LOAD PROFILE] "
+                    f"Minute {minute_index + 1}/{len(window_load)} "
+                    f"Base: {self._base_load_kw:.2f} kW "
+                    f"Reduction: {self._load_reduction_kw:.2f} kW "
+                    f"Final: {effective_load:.2f} kW"
+                )
+
+                await _execute_distributed_load_value_writer(
+                    resolver=self.resolver,
+                    total_load_kw=float(effective_load),
+                    load_blocks=dict(self.load_blocks),
+                    channel_id=channel,
+                    server_ip=server_ip,
+                    server_port=server_port,
+                    slave_id=slave_id,
+                    device_id=device_id,
+                )
+
+            if minute_index < len(window_load) - 1:
+                await asyncio.sleep(60)
+
     async def _execute_window_pv(
         self,
         window_pv,
@@ -2906,9 +3518,9 @@ class ScheduleStrategy:
         for minute_index, pv_kw in enumerate(window_pv):
             poa = window_poa[minute_index]
             logger.info(
-                f"[LOAD PROFILE] "
+                f"[PV PROFILE] "
                 f"Minute {minute_index + 1}/{len(window_pv)}: "
-                f"{pv_kw:.2f} kW"
+                f"{pv_kw:.2f} kW | "
                 f"{pv_kw:.2f} kW"
             )
 
@@ -3001,6 +3613,81 @@ class ScheduleStrategy:
         else:
             recommendations.append(f"Investigate {fault_name} and review real-time telemetry for magnitude-based corrective actions.")
 
+        return recommendations
+
+    def get_dynamic_recommendations_loop(self, fault_name: str, event: dict) -> list[dict]:
+        """
+        Generates magnitude-based EMS recommendations based on the specific fault 
+        and current system state (load, charge/discharge, grid limits).
+        """
+        recommendations = []
+        
+        # 1. Extract State Metrics
+        load_kw = event.get("load_kw", 0.0)
+        net_load_kw = event.get("net_load_kw", 0.0)
+        charge_kw = event.get("charge_kw", 0.0)
+        grid_charge_kw = event.get("grid_charge_kw", 0.0)
+        discharge_kw = event.get("discharge_kw", 0.0)
+        grid_import_kw = event.get("grid_import_kw", 0.0)
+        grid_import_limit_kw = event.get("grid_import_limit_kw", 0.0)
+        
+        # 2. Calculate System Capacities & Margins
+        # Sum of all transformer ratings (assuming kVA ≈ kW for magnitude estimation)
+        total_transformer_capacity_kw = 4000
+        
+        # Define a 5% tolerance band as requested
+        tolerance_kw = grid_import_limit_kw * 0.05
+        
+        import_headroom_kw = grid_import_limit_kw - grid_import_kw
+        transformer_headroom_kw = total_transformer_capacity_kw - net_load_kw
+
+        if fault_name == "GRID_LOSS":
+            recommendations.append({
+                "type": "discharge_increase",
+                "magnitude_kw": grid_import_kw,
+                "fault_name": fault_name
+            })
+            recommendations.append({
+                "type": "load_shed",
+                "magnitude_kw": grid_import_kw,
+                "fault_name": fault_name
+            })
+        
+        # 3. Evaluate Faults & Generate Magnitude-Based Suggestions
+        if fault_name == "TRANSFORMER_OVERLOADING" or import_headroom_kw < tolerance_kw:
+            # Calculate how much we need to correct (the deficit)
+            deficit_kw = max((import_headroom_kw - tolerance_kw), (transformer_headroom_kw - tolerance_kw), 0.0)
+            
+            # Suggestion A: Limit Charge (if currently charging)
+            if charge_kw > 0 or grid_charge_kw > 0:
+                # Suggest reducing charge by at least 500kW or 60% of the deficit
+                charge = max(charge_kw, grid_charge_kw)
+                reduce_charge_by_kw = min(charge, max(deficit_kw * 0.6, 500.0))
+                recommendations.append({
+                    "type": "charge_limit",
+                    "magnitude_kw": reduce_charge_by_kw,
+                    "fault_name": fault_name
+                })
+            
+            # Suggestion B: Increase Discharge (to offset the deficit)
+            if deficit_kw > 0:
+                # Suggest increasing discharge to cover a portion of the deficit (capped at 2MW for safety)
+                increase_discharge_by_kw = min(deficit_kw * 0.8, 2000.0)
+                recommendations.append({
+                    "type": "discharge_increase",
+                    "magnitude_kw": increase_discharge_by_kw,
+                    "fault_name": fault_name
+                })
+            
+            # Suggestion C: Load Shifting / Shedding
+            # Suggest shifting at least 500kW or 50% of the calculated deficit
+            load_shift_kw = max(deficit_kw * 0.5, 500.0, float(self.load_kw - self.carry_capacity))
+            recommendations.append({
+                "type": "load_shed",
+                "magnitude_kw": load_shift_kw,
+                "fault_name": fault_name
+            })
+        
         return recommendations
 
     @staticmethod
@@ -3286,6 +3973,7 @@ class ScheduleStrategy:
         # Data from Twin
         result["current_load_kw"] = float(device_data[Tags.Load]["value"])
         result["pv_power_kw"] = float(device_data[Tags.PV_POWER]["value"])
+        result["grid_import_kw"] = float(device_data[Tags.GRID_IMPORT_POWER]["value"])
 
         # Usable Discharge Power of Battery
         result["max_usable_kw"] = get_c_rate(result["battery_temperature"], bess) * (result["battery_capacity"] * (result["soc"] - result["min_soc"]) / 100) * result["efficiency"]
@@ -4290,6 +4978,7 @@ class ScheduleStrategy:
                         prevent_charging,
                         pv_power_kw,
                         bess_power_kw,
+                        grid_import_kw,
                         threshold_kw,
                         live_soc,
                         current_load_kw,
@@ -4305,6 +4994,7 @@ class ScheduleStrategy:
                         config["prevent_charging"],
                         config["pv_power_kw"],
                         config["bess_power_kw"],
+                        config["grid_import_kw"],
                         config["threshold_kw"],
                         config["soc"],
                         config["current_load_kw"],
@@ -4359,7 +5049,12 @@ class ScheduleStrategy:
                 # current_load_kw = self.load_kw
                 if fault_code > 0:
                     self.fault = fault_code
-                    logger.info(f"Fault Detected: {self.fault}")
+                    logger.info(
+                            f"{LogColor.YELLOW}"
+                            f"[PeakShavingDischarge] Fault detected: "
+                            f"{FaultCode(fault_code).name}. "
+                            f"{LogColor.RESET}"
+                        )
 
                 logger.info(
                     f"[PeakShavingCharging] "
@@ -4368,6 +5063,7 @@ class ScheduleStrategy:
                     f"PV={pv_power_kw:.2f} kW | "
                     f"Load={current_load_kw:.2f} kW | "
                     f"BESS={bess_power_kw:.2f} kW | "
+                    f"GRID={grid_import_kw:.2f} kW | "
                     f"Decision={event_decision} | "
                     f"Fault={self.fault}"
                 )
@@ -4376,20 +5072,20 @@ class ScheduleStrategy:
                 # 10.2 EVENT TARGET ENERGY
                 # =================================================================
 
-                if (
-                    event_target_energy_mwh is not None
-                    and current_energy_mwh >= event_target_energy_mwh
-                ):
+                # if (
+                #     event_target_energy_mwh is not None
+                #     and current_energy_mwh >= event_target_energy_mwh
+                # ):
 
-                    logger.info(
-                        f"{LogColor.GREEN}"
-                        f"[PeakShavingCharging] Event target energy reached. "
-                        f"Current={current_energy_mwh:.3f} MWh | "
-                        f"Target={event_target_energy_mwh:.3f} MWh"
-                        f"{LogColor.RESET}"
-                    )
+                #     logger.info(
+                #         f"{LogColor.GREEN}"
+                #         f"[PeakShavingCharging] Event target energy reached. "
+                #         f"Current={current_energy_mwh:.3f} MWh | "
+                #         f"Target={event_target_energy_mwh:.3f} MWh"
+                #         f"{LogColor.RESET}"
+                #     )
 
-                    break
+                #     break
 
                 # =================================================================
                 # 10.3 BESS MAX SOC SAFETY
@@ -4472,11 +5168,19 @@ class ScheduleStrategy:
 
                     if event_grid_import_limit_kw is not None:
 
-                        available_grid_capacity_kw = max(
-                            0.0,
-                            event_grid_import_limit_kw
+                        # available_grid_capacity_kw = max(
+                        #     0.0,
+                        #     0 if fault_code > 0 and FaultCode(fault_code).name == "GRID_LOSS" else
+                        #     (event_grid_import_limit_kw
+                        #     - current_load_kw
+                        #     + pv_power_kw)
+                        # )
+
+                        available_grid_capacity_kw = (
+                            (0 - current_load_kw + pv_power_kw)  if fault_code > 0 and FaultCode(fault_code).name == "GRID_LOSS" else
+                            (event_grid_import_limit_kw
                             - current_load_kw
-                            + pv_power_kw
+                            + pv_power_kw)
                         )
 
                     else:
@@ -4505,6 +5209,7 @@ class ScheduleStrategy:
                     logger.info(
                         f"[PeakShavingCharging] "
                         f"GRID CHARGE | "
+                        f"GridPower={grid_import_kw:.2f} kW | "
                         f"EventRequest={requested_grid_charge_kw:.2f} kW | "
                         f"GridCapacity={available_grid_capacity_kw:.2f} kW | "
                         f"Executable={source_available_kw:.2f} kW"
@@ -4587,6 +5292,49 @@ class ScheduleStrategy:
                 )
 
                 # =================================================================
+                # 10.8 Precheck Source Availability
+                # =================================================================
+                if source_available_kw < 0:
+                    logger.warning(
+                        f"{LogColor.YELLOW}"
+                        f"[PeakShavingCharging] "
+                        f"Source available power is negative: "
+                        f"{source_available_kw:.2f} kW. "
+                        f"Setting to zero."
+                        f"{LogColor.RESET}"
+                    )
+
+                    # Discharge Loop
+                    discharge_result = await self.PeakShavingDischargeStrategyType7(
+                        resolver=resolver,
+                        controller_static=controller_static,
+                        device_id=device_id,
+                        channel=channel,
+                        server_ip=server_ip,
+                        server_port=server_port,
+                        slave_id=slave_id,
+                        excess_load=source_available_kw,
+                        poi_meter_id=poi_meter_id,
+                        target_limit=source_available_kw,
+                        extra_info=extra_info,
+                        event=event,
+
+                        # Shared execution timer
+                        start_time=start_time,
+                        deadline=deadline,
+                    )
+
+                    results.append({
+                        "status": "discharge_executed",
+                        "soc": current_soc,
+                        "battery_energy_mwh": current_energy_mwh,
+                        "charge_kw": 0,
+                        "decision": event_decision,
+                        "discharge_result": discharge_result,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+
+                # =================================================================
                 # 10.10 FINAL SETPOINT
                 # =================================================================
 
@@ -4611,14 +5359,14 @@ class ScheduleStrategy:
                 # 10.11 ZERO SETPOINT
                 # =================================================================
 
-                if new_setpoint <= 0:
+                # if new_setpoint <= 0:
 
-                    logger.info(
-                        "[PeakShavingCharging] "
-                        "Calculated setpoint is zero."
-                    )
+                #     logger.info(
+                #         "[PeakShavingCharging] "
+                #         "Calculated setpoint is zero."
+                #     )
 
-                    break
+                #     break
 
                 # =================================================================
                 # 10.12 UPDATE SETPOINT
@@ -4728,343 +5476,612 @@ class ScheduleStrategy:
         return results
 
     async def PeakShavingDischargeStrategyType7(
-            self,
-            resolver,
-            controller_static,
-            device_id: str,
-            channel,
-            server_ip,
-            server_port,
-            slave_id,
-            excess_load: float,
-            poi_meter_id: str,
-            target_limit: float,
-            authority: str = "internal",
-            extra_info: dict = None,
-            event: dict = None,
-        ):
-            """
-            Schedule Strategy Type 7 - Event Based Peak Shaving Discharge.
+        self,
+        resolver,
+        controller_static,
+        device_id: str,
+        channel,
+        server_ip,
+        server_port,
+        slave_id,
+        excess_load: float,
+        poi_meter_id: str,
+        target_limit: float,
+        authority: str = "internal",
+        extra_info: dict = None,
+        event: dict = None,
+        start_time: float = None,
+        deadline: float = None,
+    ):
+        """
+        Schedule Strategy Type 7 - Event Based Peak Shaving Discharge.
 
-            The parent event is authoritative.
+        The parent event is authoritative.
 
-            Example event:
+        Example event:
 
-                {
-                    "decision": "discharge",
-                    "discharge_kw": 1500.0,
-                    "grid_import_limit_kw": 4000.0,
-                    "soc_percent": 21.64,
-                    "battery_energy_mwh": 5.628,
-                    ...
-                }
+            {
+                "decision": "discharge",
+                "discharge_kw": 1500.0,
+                "grid_import_limit_kw": 4000.0,
+                "soc_percent": 21.64,
+                "battery_energy_mwh": 5.628,
+                ...
+            }
 
-            Behaviour:
+        Behaviour:
 
-                1. Event determines whether discharge is allowed.
-                2. Event provides the requested discharge power.
-                3. Live grid conditions are checked every polling cycle.
-                4. Required discharge is recalculated from live grid power.
-                5. Discharge is limited by:
-                    - event discharge_kw
-                    - live grid requirement
-                    - max_discharge_kw
-                    - max_usable_kw
-                    - minimum SOC
-                6. Event target SOC / energy stops the event.
-                7. Always sends zero discharge in finally.
-            """
+            1. Event determines whether discharge is allowed.
+            2. Event provides the requested discharge power.
+            3. Live grid conditions are checked every polling cycle.
+            4. Required discharge is recalculated from live grid power.
+            5. Discharge is limited by:
+                - event discharge_kw
+                - live grid requirement
+                - max_discharge_kw
+                - max_usable_kw
+                - minimum SOC
+            6. Event target SOC / energy stops the event.
+            7. Always sends zero discharge in finally.
+        """
 
-            extra_info = extra_info or {}
-            event = event or {}
+        extra_info = extra_info or {}
+        event = event or {}
 
-            results = []
+        results = []
 
-            current_soc = None
-            current_energy_mwh = None
-            last_setpoint = 0.0
-            slot_number = 1
+        current_soc = None
+        current_energy_mwh = None
+        last_setpoint = 0.0
+        slot_number = 1
 
-            try:
+        try:
 
-                logger.info(
-                    f"{LogColor.MAGENTA}"
-                    f"[PeakShavingDischarge] Starting event discharge."
-                    f"{LogColor.RESET}"
-                )
+            logger.info(
+                f"{LogColor.MAGENTA}"
+                f"[PeakShavingDischarge] Starting event discharge."
+                f"{LogColor.RESET}"
+            )
 
-                # =========================================================================
-                # MAXIMUM EXECUTION TIME: 15 MINUTES
-                # =========================================================================
-        
-                MAX_EXECUTION_SECONDS = 15 * 60  # 900 seconds
-        
+            # =========================================================================
+            # MAXIMUM EXECUTION TIME: 15 MINUTES
+            # =========================================================================
+    
+            MAX_EXECUTION_SECONDS = 15 * 60  # 900 seconds
+    
+            # Use parent event timer if provided
+            if start_time is None:
                 start_time = time.monotonic()
+
+            if deadline is None:
                 deadline = start_time + MAX_EXECUTION_SECONDS
 
-                # Set Event running time in ETALab
-                self.set_event_running_time()
-        
-                logger.info(
-                    "[PeakShavingCharging] Maximum execution time: 15 minutes."
+            # Set Event running time in ETALab
+            self.set_event_running_time()
+    
+            logger.info(
+                "[PeakShavingCharging] Maximum execution time: 15 minutes."
+            )
+
+            # =====================================================================
+            # 1. EVENT INFORMATION
+            # =====================================================================
+
+            event_decision = str(
+                event.get("decision", "")
+            ).strip().lower()
+
+            event_target_soc = event.get("soc_percent")
+
+            if event_target_soc is not None:
+                event_target_soc = float(event_target_soc)
+
+            event_target_energy_mwh = event.get(
+                "battery_energy_mwh"
+            )
+
+            event_target_grid_import_kw = event.get(
+                "grid_import_kw"
+            )
+
+            if event_target_energy_mwh is not None:
+                event_target_energy_mwh = float(
+                    event_target_energy_mwh
                 )
 
-                # =====================================================================
-                # 1. EVENT INFORMATION
-                # =====================================================================
+            event_discharge_kw = float(
+                event.get("discharge_kw", 0.0) or 0.0
+            )
 
-                event_decision = str(
-                    event.get("decision", "")
-                ).strip().lower()
+            event_grid_import_limit_kw = event.get(
+                "grid_import_limit_kw"
+            )
 
-                event_target_soc = event.get("soc_percent")
-
-                if event_target_soc is not None:
-                    event_target_soc = float(event_target_soc)
-
-                event_target_energy_mwh = event.get(
-                    "battery_energy_mwh"
+            if event_grid_import_limit_kw is not None:
+                event_grid_import_limit_kw = float(
+                    event_grid_import_limit_kw
                 )
 
-                if event_target_energy_mwh is not None:
-                    event_target_energy_mwh = float(
-                        event_target_energy_mwh
-                    )
+            event_target_limit_kw = event.get(
+                "target_limit_kw"
+            )
 
-                event_discharge_kw = float(
-                    event.get("discharge_kw", 0.0) or 0.0
+            if event_target_limit_kw is not None:
+                event_target_limit_kw = float(
+                    event_target_limit_kw
+                )
+            else:
+                event_target_limit_kw = float(
+                    target_limit
                 )
 
-                event_grid_import_limit_kw = event.get(
-                    "grid_import_limit_kw"
-                )
+            logger.info(
+                f"{LogColor.CYAN}"
+                f"[PeakShavingDischarge] Event | "
+                f"Decision={event_decision} | "
+                f"Discharge={event_discharge_kw:.2f} kW | "
+                f"GridImportLimit={event_grid_import_limit_kw:.2f} kW | "
+                f"GridLimit={event_grid_import_limit_kw} kW | "
+                f"TargetLimit={event_target_limit_kw:.2f} kW | "
+                f"TargetSOC={event_target_soc}% | "
+                f"TargetEnergy={event_target_energy_mwh} MWh"
+                f"{LogColor.RESET}"
+            )
 
-                if event_grid_import_limit_kw is not None:
-                    event_grid_import_limit_kw = float(
-                        event_grid_import_limit_kw
-                    )
+            # =====================================================================
+            # 2. VALIDATE EVENT
+            # =====================================================================
 
-                event_target_limit_kw = event.get(
-                    "target_limit_kw"
-                )
+            # if event_decision not in (
+            #     "discharge",
+            #     "peak_shave",
+            #     "peak_shaving",
+            # ):
 
-                if event_target_limit_kw is not None:
-                    event_target_limit_kw = float(
-                        event_target_limit_kw
-                    )
-                else:
-                    event_target_limit_kw = float(
-                        target_limit
-                    )
+            #     logger.warning(
+            #         f"{LogColor.YELLOW}"
+            #         f"[PeakShavingDischarge] "
+            #         f"Invalid discharge event decision: "
+            #         f"{event_decision}"
+            #         f"{LogColor.RESET}"
+            #     )
 
-                logger.info(
-                    f"{LogColor.CYAN}"
-                    f"[PeakShavingDischarge] Event | "
-                    f"Decision={event_decision} | "
-                    f"Discharge={event_discharge_kw:.2f} kW | "
-                    f"GridLimit={event_grid_import_limit_kw} kW | "
-                    f"TargetLimit={event_target_limit_kw:.2f} kW | "
-                    f"TargetSOC={event_target_soc}% | "
-                    f"TargetEnergy={event_target_energy_mwh} MWh"
+            #     return [{
+            #         "status": "no_action",
+            #         "reason": "invalid_discharge_decision",
+            #         "decision": event_decision,
+            #         "timestamp": datetime.now().isoformat(),
+            #     }]
+
+            # if event_discharge_kw <= 0:
+
+            #     logger.warning(
+            #         f"{LogColor.YELLOW}"
+            #         f"[PeakShavingDischarge] "
+            #         f"Event discharge power is zero."
+            #         f"{LogColor.RESET}"
+            #     )
+
+            #     return [{
+            #         "status": "no_action",
+            #         "reason": "zero_event_discharge",
+            #         "timestamp": datetime.now().isoformat(),
+            #     }]
+
+            # =====================================================================
+            # 3. STATIC PARAMETERS
+            # =====================================================================
+
+            battery_capacity = controller_static.get(
+                "battery_capacity"
+            )
+
+            if battery_capacity is None:
+                logger.error(
+                    f"{LogColor.RED}"
+                    f"[PeakShavingDischarge] "
+                    f"Battery capacity unavailable."
                     f"{LogColor.RESET}"
                 )
 
-                # =====================================================================
-                # 2. VALIDATE EVENT
-                # =====================================================================
+                return [{
+                    "status": "error",
+                    "reason": "battery_capacity_unavailable",
+                    "timestamp": datetime.now().isoformat(),
+                }]
 
-                if event_decision not in (
-                    "discharge",
-                    "peak_shave",
-                    "peak_shaving",
-                ):
+            battery_capacity = float(
+                battery_capacity
+            )
 
-                    logger.warning(
-                        f"{LogColor.YELLOW}"
-                        f"[PeakShavingDischarge] "
-                        f"Invalid discharge event decision: "
-                        f"{event_decision}"
-                        f"{LogColor.RESET}"
-                    )
+            # =====================================================================
+            # 4. INITIAL LIVE DATA
+            # =====================================================================
 
-                    return [{
-                        "status": "no_action",
-                        "reason": "invalid_discharge_decision",
-                        "decision": event_decision,
-                        "timestamp": datetime.now().isoformat(),
-                    }]
+            data = resolver.get_latest_device_data(
+                device_id
+            )
 
-                if event_discharge_kw <= 0:
+            current_soc = data.get(
+                Tags.BATTERY_SOC,
+                {}
+            ).get("value")
 
-                    logger.warning(
-                        f"{LogColor.YELLOW}"
-                        f"[PeakShavingDischarge] "
-                        f"Event discharge power is zero."
-                        f"{LogColor.RESET}"
-                    )
+            if current_soc is None:
 
-                    return [{
-                        "status": "no_action",
-                        "reason": "zero_event_discharge",
-                        "timestamp": datetime.now().isoformat(),
-                    }]
-
-                # =====================================================================
-                # 3. STATIC PARAMETERS
-                # =====================================================================
-
-                battery_capacity = controller_static.get(
-                    "battery_capacity"
+                logger.error(
+                    f"{LogColor.RED}"
+                    f"[PeakShavingDischarge] "
+                    f"Current SOC unavailable."
+                    f"{LogColor.RESET}"
                 )
 
-                if battery_capacity is None:
-                    logger.error(
-                        f"{LogColor.RED}"
-                        f"[PeakShavingDischarge] "
-                        f"Battery capacity unavailable."
-                        f"{LogColor.RESET}"
-                    )
+                return [{
+                    "status": "error",
+                    "reason": "soc_unavailable",
+                    "timestamp": datetime.now().isoformat(),
+                }]
 
-                    return [{
-                        "status": "error",
-                        "reason": "battery_capacity_unavailable",
-                        "timestamp": datetime.now().isoformat(),
-                    }]
+            current_soc = float(
+                current_soc
+            )
 
-                battery_capacity = float(
-                    battery_capacity
-                )
+            # =====================================================================
+            # 5. BATTERY ENERGY HELPER
+            # =====================================================================
 
-                # =====================================================================
-                # 4. INITIAL LIVE DATA
-                # =====================================================================
+            def get_battery_energy_mwh(
+                live_data,
+                soc
+            ):
+                """
+                Prefer live battery energy.
 
-                data = resolver.get_latest_device_data(
-                    device_id
-                )
+                If battery energy tag is unavailable,
+                calculate it from battery capacity and SOC.
+                """
 
-                current_soc = data.get(
-                    Tags.BATTERY_SOC,
+                energy_value = live_data.get(
+                    Tags.BATTERY_ENERGY,
                     {}
                 ).get("value")
 
-                if current_soc is None:
+                if energy_value is not None:
 
-                    logger.error(
-                        f"{LogColor.RED}"
-                        f"[PeakShavingDischarge] "
-                        f"Current SOC unavailable."
+                    try:
+                        return float(
+                            energy_value / 1000.0
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError
+                    ):
+                        pass
+
+                return (
+                    battery_capacity
+                    * float(soc)
+                    / 100.0
+                    / 1000.0
+                )
+
+            current_energy_mwh = get_battery_energy_mwh(
+                data,
+                current_soc
+            )
+
+            # =====================================================================
+            # 6. INITIAL TARGET CHECK
+            # =====================================================================
+
+            # if (
+            #     event_target_soc is not None
+            #     and current_soc <= event_target_soc
+            # ):
+
+            #     logger.info(
+            #         f"{LogColor.GREEN}"
+            #         f"[PeakShavingDischarge] "
+            #         f"Target SOC already reached."
+            #         f" Current={current_soc:.2f}% "
+            #         f"Target={event_target_soc:.2f}%"
+            #         f"{LogColor.RESET}"
+            #     )
+
+            #     return [{
+            #         "status": "completed",
+            #         "reason": "event_target_soc_reached",
+            #         "soc": current_soc,
+            #         "battery_energy_mwh": current_energy_mwh,
+            #         "discharge_kw": 0,
+            #         "timestamp": datetime.now().isoformat(),
+            #     }]
+
+            # if (
+            #     event_target_energy_mwh is not None
+            #     and current_energy_mwh <= event_target_energy_mwh
+            # ):
+
+            #     logger.info(
+            #         f"{LogColor.GREEN}"
+            #         f"[PeakShavingDischarge] "
+            #         f"Target battery energy already reached."
+            #         f" Current={current_energy_mwh:.3f} MWh "
+            #         f"Target={event_target_energy_mwh:.3f} MWh"
+            #         f"{LogColor.RESET}"
+            #     )
+
+            #     return [{
+            #         "status": "completed",
+            #         "reason": "event_target_energy_reached",
+            #         "soc": current_soc,
+            #         "battery_energy_mwh": current_energy_mwh,
+            #         "discharge_kw": 0,
+            #         "timestamp": datetime.now().isoformat(),
+            #     }]
+
+            # =====================================================================
+            # 7. LOAD INITIAL CONFIG
+            # =====================================================================
+
+            try:
+
+                config = await ScheduleStrategy.bess_decision(
+                    device_id,
+                    poi_meter_id
+                )
+
+                (
+                    block_discharging,
+                    pv_power_kw,
+                    bess_power_kw,
+                    live_soc,
+                    current_load_kw,
+                    min_soc,
+                    max_discharge_kw,
+                    max_usable_kw,
+                    efficiency,
+                    grid_import_kw,
+                ) = (
+                    config["block_discharging"],
+                    config["pv_power_kw"],
+                    config["bess_power_kw"],
+                    config["soc"],
+                    config["current_load_kw"],
+                    config["min_soc"],
+                    config["max_discharge_kw"],
+                    config["max_usable_kw"],
+                    config["efficiency"],
+                    config["grid_import_kw"]
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    f"{LogColor.RED}"
+                    f"[PeakShavingDischarge] "
+                    f"Error loading live parameters: {e}"
+                    f"{LogColor.RESET}"
+                )
+
+                return [{
+                    "status": "error",
+                    "reason": "live_config_error",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat(),
+                }]
+
+            current_soc = float(
+                live_soc
+            )
+
+            min_soc = float(
+                min_soc
+            )
+
+            max_discharge_kw = float(
+                max_discharge_kw
+                or 0
+            )
+
+            max_usable_kw = float(
+                max_usable_kw
+                or 0
+            )
+
+            # =====================================================================
+            # 8. DETERMINE INITIAL DISCHARGE
+            # =====================================================================
+
+            pv_power_kw = self.pv_kw
+            # current_load_kw = self.load_kw
+
+            bess_power_kw = float(
+                bess_power_kw or 0
+            )
+
+            # Grid import/load seen by POI.
+            grid_power = (
+                current_load_kw
+                - pv_power_kw
+                - bess_power_kw
+            )
+            # grid_power = grid_import_kw
+
+            # How much additional BESS discharge is currently required.
+            if event_grid_import_limit_kw is not None:
+
+                live_required_discharge_kw = max(
+                    0.0,
+                    grid_power
+                    - event_grid_import_limit_kw
+                )
+
+            else:
+
+                live_required_discharge_kw = max(
+                    0.0,
+                    grid_power
+                    - event_target_limit_kw
+                )
+
+            # Event is the upper authority.
+            initial_setpoint_kw = min(
+                # event_discharge_kw,
+                live_required_discharge_kw
+                if live_required_discharge_kw > 0
+                else event_discharge_kw,
+                max_discharge_kw,
+                max_usable_kw,
+            )
+
+            initial_setpoint_kw = max(
+                0.0,
+                initial_setpoint_kw
+            )
+
+            logger.info(
+                f"[PeakShavingDischarge] Initial calculation | "
+                f"Load={current_load_kw:.2f} kW | "
+                f"PV={pv_power_kw:.2f} kW | "
+                f"BESS={bess_power_kw:.2f} kW | "
+                f"Grid={grid_power:.2f} kW | "
+                f"LiveRequired={live_required_discharge_kw:.2f} kW | "
+                f"EventDischarge={event_discharge_kw:.2f} kW | "
+                f"Setpoint={initial_setpoint_kw:.2f} kW"
+            )
+
+            # =====================================================================
+            # 9. INITIAL SAFETY CHECK
+            # =====================================================================
+
+            if block_discharging:
+
+                logger.warning(
+                    f"{LogColor.RED}"
+                    f"[PeakShavingDischarge] "
+                    f"Discharging blocked by live configuration."
+                    f"{LogColor.RESET}"
+                )
+
+                return [{
+                    "status": "no_action",
+                    "reason": "discharging_blocked",
+                    "soc": current_soc,
+                    "timestamp": datetime.now().isoformat(),
+                }]
+
+            if current_soc <= min_soc:
+
+                logger.warning(
+                    f"{LogColor.RED}"
+                    f"[PeakShavingDischarge] "
+                    f"Minimum SOC already reached."
+                    f"{LogColor.RESET}"
+                )
+
+                return [{
+                    "status": "completed",
+                    "reason": "min_soc_reached",
+                    "soc": current_soc,
+                    "timestamp": datetime.now().isoformat(),
+                }]
+
+            # if initial_setpoint_kw <= 0:
+
+            #     logger.info(
+            #         "[PeakShavingDischarge] "
+            #         "No discharge currently required."
+            #     )
+
+            #     return [{
+            #         "status": "no_action",
+            #         "reason": "no_live_discharge_required",
+            #         "soc": current_soc,
+            #         "battery_energy_mwh": current_energy_mwh,
+            #         "discharge_kw": 0,
+            #         "timestamp": datetime.now().isoformat(),
+            #     }]
+
+            # =====================================================================
+            # 10. FIRST WRITE
+            # =====================================================================
+
+            last_setpoint = initial_setpoint_kw
+
+            logger.info(
+                f"{LogColor.MAGENTA}"
+                f"[PeakShavingDischarge] "
+                f"WRITE FIRST SETPOINT = "
+                f"{initial_setpoint_kw:.2f} kW"
+                f"{LogColor.RESET}"
+            )
+
+            await _execute_slot_async_discharge(
+                resolver=resolver,
+                setpoint_kw=int(initial_setpoint_kw),
+                channel_id=channel,
+                server_ip=server_ip,
+                server_port=server_port,
+                slave_id=slave_id,
+                device_id=device_id,
+                slot_number=1,
+                extra_info={
+                    **extra_info,
+                    "strategy_id": 7,
+                    "event_decision": event_decision,
+                    "event_discharge_kw": event_discharge_kw,
+                    "event_target_soc": event_target_soc,
+                    "event_target_energy_mwh": event_target_energy_mwh,
+                },
+            )
+
+            results.append({
+                "soc": current_soc,
+                "battery_energy_mwh": current_energy_mwh,
+                "discharge_kw": initial_setpoint_kw,
+                "decision": event_decision,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            # =====================================================================
+            # 11. DISCHARGE LOOP
+            # =====================================================================
+
+            logger.info(
+                "[PeakShavingDischarge] Entering discharge loop."
+            )
+
+            await asyncio.sleep(10)
+            
+            fault_resolve_idx = 0
+            last_recommendation_type = "fine"
+
+            fault_start_time = None
+            previous_fault_code = 0
+            while True:
+                # =================================================================
+                # 10.1 MAXIMUM EXECUTION TIME CHECK
+                # =================================================================
+
+                elapsed = time.monotonic() - start_time
+
+                if elapsed >= MAX_EXECUTION_SECONDS:
+
+                    logger.warning(
+                        f"{LogColor.YELLOW}"
+                        f"[PeakShavingCharging] 15-minute execution limit reached. "
+                        f"Elapsed={elapsed:.1f} seconds. Stopping charging loop."
                         f"{LogColor.RESET}"
                     )
 
-                    return [{
-                        "status": "error",
-                        "reason": "soc_unavailable",
-                        "timestamp": datetime.now().isoformat(),
-                    }]
+                    break
+                await asyncio.sleep(1)
 
-                current_soc = float(
-                    current_soc
-                )
-
-                # =====================================================================
-                # 5. BATTERY ENERGY HELPER
-                # =====================================================================
-
-                def get_battery_energy_mwh(
-                    live_data,
-                    soc
-                ):
-                    """
-                    Prefer live battery energy.
-
-                    If battery energy tag is unavailable,
-                    calculate it from battery capacity and SOC.
-                    """
-
-                    energy_value = live_data.get(
-                        Tags.BATTERY_ENERGY,
-                        {}
-                    ).get("value")
-
-                    if energy_value is not None:
-
-                        try:
-                            return float(
-                                energy_value / 1000.0
-                            )
-
-                        except (
-                            TypeError,
-                            ValueError
-                        ):
-                            pass
-
-                    return (
-                        battery_capacity
-                        * float(soc)
-                        / 100.0
-                        / 1000.0
-                    )
-
-                current_energy_mwh = get_battery_energy_mwh(
-                    data,
-                    current_soc
-                )
-
-                # =====================================================================
-                # 6. INITIAL TARGET CHECK
-                # =====================================================================
-
-                # if (
-                #     event_target_soc is not None
-                #     and current_soc <= event_target_soc
-                # ):
-
-                #     logger.info(
-                #         f"{LogColor.GREEN}"
-                #         f"[PeakShavingDischarge] "
-                #         f"Target SOC already reached."
-                #         f" Current={current_soc:.2f}% "
-                #         f"Target={event_target_soc:.2f}%"
-                #         f"{LogColor.RESET}"
-                #     )
-
-                #     return [{
-                #         "status": "completed",
-                #         "reason": "event_target_soc_reached",
-                #         "soc": current_soc,
-                #         "battery_energy_mwh": current_energy_mwh,
-                #         "discharge_kw": 0,
-                #         "timestamp": datetime.now().isoformat(),
-                #     }]
-
-                # if (
-                #     event_target_energy_mwh is not None
-                #     and current_energy_mwh <= event_target_energy_mwh
-                # ):
-
-                #     logger.info(
-                #         f"{LogColor.GREEN}"
-                #         f"[PeakShavingDischarge] "
-                #         f"Target battery energy already reached."
-                #         f" Current={current_energy_mwh:.3f} MWh "
-                #         f"Target={event_target_energy_mwh:.3f} MWh"
-                #         f"{LogColor.RESET}"
-                #     )
-
-                #     return [{
-                #         "status": "completed",
-                #         "reason": "event_target_energy_reached",
-                #         "soc": current_soc,
-                #         "battery_energy_mwh": current_energy_mwh,
-                #         "discharge_kw": 0,
-                #         "timestamp": datetime.now().isoformat(),
-                #     }]
-
-                # =====================================================================
-                # 7. LOAD INITIAL CONFIG
-                # =====================================================================
+                # =================================================================
+                # 11.1 LOAD LIVE CONFIG
+                # =================================================================
 
                 try:
 
@@ -5083,6 +6100,8 @@ class ScheduleStrategy:
                         max_discharge_kw,
                         max_usable_kw,
                         efficiency,
+                        fault_code,
+                        grid_import_kw,
                     ) = (
                         config["block_discharging"],
                         config["pv_power_kw"],
@@ -5093,6 +6112,8 @@ class ScheduleStrategy:
                         config["max_discharge_kw"],
                         config["max_usable_kw"],
                         config["efficiency"],
+                        config["fault_code"],
+                        config["grid_import_kw"]
                     )
 
                 except Exception as e:
@@ -5104,12 +6125,93 @@ class ScheduleStrategy:
                         f"{LogColor.RESET}"
                     )
 
-                    return [{
-                        "status": "error",
-                        "reason": "live_config_error",
-                        "error": str(e),
-                        "timestamp": datetime.now().isoformat(),
-                    }]
+                    # break
+                    await asyncio.sleep(1)  # Wait before retrying
+                    continue
+
+                # =================================================================
+                # 11.2 LIVE VALUES
+                # =================================================================
+
+                if fault_code > 0:
+
+                    # Start sustain timer when a new fault is detected
+                    if fault_code != previous_fault_code:
+                        fault_start_time = time.monotonic()
+                        previous_fault_code = fault_code
+
+                        logger.info(
+                            f"{LogColor.YELLOW}"
+                            f"[PeakShavingDischarge] Fault detected: "
+                            f"{FaultCode(fault_code).name}. "
+                            f"Waiting {self.FAULT_SUSTAIN_SECONDS} seconds before applying recommendation."
+                            f"{LogColor.RESET}"
+                        )
+
+                    # Check fault sustain duration
+                    fault_duration = time.monotonic() - fault_start_time
+
+                    if fault_duration >= self.FAULT_SUSTAIN_SECONDS:
+
+                        self.fault = fault_code
+
+                        # Skip recommendation for GRID_LOSS when setpoint matches current load
+                        if (
+                            FaultCode(self.fault).name == "GRID_LOSS" and
+                            last_setpoint == current_load_kw
+                        ):
+                            # Fault cleared: reset sustain timer and recommendation state
+                            fault_start_time = None
+                            previous_fault_code = 0
+                            fault_resolve_idx = 0
+                            last_recommendation_type = "fine"
+                            logger.info(f"Skipped & Reset recommendation: GRID_LOSS and setpoint={last_setpoint} matches current load={current_load_kw}.")
+
+                        else:
+
+                            recommedation = self.get_dynamic_recommendations_loop(
+                                FaultCode(self.fault).name,
+                                event
+                            )
+
+                            if (
+                                recommedation[fault_resolve_idx].get("type") == "load_shed"
+                                and recommedation[fault_resolve_idx].get("type") != last_recommendation_type
+                            ):
+
+                                logger.info(
+                                    f"{LogColor.YELLOW}"
+                                    f"[PeakShavingDischarge] Fault sustained for "
+                                    f"{fault_duration:.1f} seconds. "
+                                    f"Applying recommendation: Shed load of "
+                                    f"{recommedation[fault_resolve_idx].get('magnitude_kw'):.2f} kW."
+                                    f"{LogColor.RESET}"
+                                )
+
+                                await self.reduce_load(
+                                    reduction_percentage=float(recommedation[fault_resolve_idx].get('magnitude_kw')/self.peak_load * 100),
+                                    channel=channel,
+                                    server_ip=server_ip,
+                                    server_port=server_port,
+                                    slave_id=slave_id,
+                                    device_id=device_id,
+                                )
+
+                                last_recommendation_type = recommedation[fault_resolve_idx].get("type")
+
+                            if (
+                                len(recommedation) > 1
+                                and fault_resolve_idx < len(recommedation) - 1
+                            ):
+                                last_recommendation_type = recommedation[fault_resolve_idx].get("type")
+                                fault_resolve_idx += 1
+
+                else:
+                    # Fault cleared: reset sustain timer and recommendation state
+                    fault_start_time = None
+                    previous_fault_code = 0
+                    fault_resolve_idx = 0
+                    last_recommendation_type = "fine"
 
                 current_soc = float(
                     live_soc
@@ -5120,79 +6222,115 @@ class ScheduleStrategy:
                 )
 
                 max_discharge_kw = float(
-                    max_discharge_kw
-                    or 0
+                    max_discharge_kw or 0
                 )
 
                 max_usable_kw = float(
-                    max_usable_kw
-                    or 0
+                    max_usable_kw or 0
                 )
 
-                # =====================================================================
-                # 8. DETERMINE INITIAL DISCHARGE
-                # =====================================================================
-
                 pv_power_kw = self.pv_kw
-                # current_load_kw = self.load_kw
+                self.load_kw = current_load_kw
 
                 bess_power_kw = float(
                     bess_power_kw or 0
                 )
 
-                # Grid import/load seen by POI.
-                grid_power = (
-                    current_load_kw
-                    - pv_power_kw
-                    - bess_power_kw
+                live_data = resolver.get_latest_device_data(
+                    device_id
                 )
 
-                # How much additional BESS discharge is currently required.
-                if event_grid_import_limit_kw is not None:
-
-                    live_required_discharge_kw = max(
-                        0.0,
-                        grid_power
-                        - event_grid_import_limit_kw
-                    )
-
-                else:
-
-                    live_required_discharge_kw = max(
-                        0.0,
-                        grid_power
-                        - event_target_limit_kw
-                    )
-
-                # Event is the upper authority.
-                initial_setpoint_kw = min(
-                    event_discharge_kw,
-                    live_required_discharge_kw
-                    if live_required_discharge_kw > 0
-                    else event_discharge_kw,
-                    max_discharge_kw,
-                    max_usable_kw,
+                current_energy_mwh = get_battery_energy_mwh(
+                    live_data,
+                    current_soc
                 )
 
-                initial_setpoint_kw = max(
-                    0.0,
-                    initial_setpoint_kw
-                )
+                # =================================================================
+                # 11.3 LIVE GRID POWER
+                # =================================================================
+
+                # grid_power = (
+                #     current_load_kw
+                #     - pv_power_kw
+                #     - bess_power_kw
+                # )
+                grid_power = grid_import_kw
+
+                # =================================================================
+                # 11.4 LOG
+                # =================================================================
 
                 logger.info(
-                    f"[PeakShavingDischarge] Initial calculation | "
+                    f"[PeakShavingDischarge] "
+                    f"SOC={current_soc:.2f}% | "
+                    f"Energy={current_energy_mwh:.3f} MWh | "
                     f"Load={current_load_kw:.2f} kW | "
                     f"PV={pv_power_kw:.2f} kW | "
                     f"BESS={bess_power_kw:.2f} kW | "
                     f"Grid={grid_power:.2f} kW | "
-                    f"LiveRequired={live_required_discharge_kw:.2f} kW | "
-                    f"EventDischarge={event_discharge_kw:.2f} kW | "
-                    f"Setpoint={initial_setpoint_kw:.2f} kW"
+                    f"Setpoint={last_setpoint:.2f} kW"
                 )
 
-                # =====================================================================
-                # 9. INITIAL SAFETY CHECK
-                # =====================================================================
+                # =================================================================
+                # 11.5 TARGET SOC
+                # =================================================================
+
+                # if (
+                #     event_target_soc is not None
+                #     and current_soc <= event_target_soc
+                # ):
+
+                #     logger.info(
+                #         f"{LogColor.GREEN}"
+                #         f"[PeakShavingDischarge] "
+                #         f"Event target SOC reached. "
+                #         f"Current={current_soc:.2f}% | "
+                #         f"Target={event_target_soc:.2f}%"
+                #         f"{LogColor.RESET}"
+                #     )
+
+                #     break
+
+                # =================================================================
+                # 11.6 TARGET ENERGY
+                # =================================================================
+
+                # if (
+                #     event_target_energy_mwh is not None
+                #     and current_energy_mwh <= event_target_energy_mwh
+                # ):
+
+                #     logger.info(
+                #         f"{LogColor.GREEN}"
+                #         f"[PeakShavingDischarge] "
+                #         f"Event target energy reached. "
+                #         f"Current={current_energy_mwh:.3f} MWh | "
+                #         f"Target={event_target_energy_mwh:.3f} MWh"
+                #         f"{LogColor.RESET}"
+                #     )
+
+                #     break
+
+                # =================================================================
+                # 11.7 MINIMUM SOC
+                # =================================================================
+
+                if current_soc <= min_soc:
+
+                    logger.warning(
+                        f"{LogColor.RED}"
+                        f"[PeakShavingDischarge] "
+                        f"Minimum SOC reached. "
+                        f"SOC={current_soc:.2f}% | "
+                        f"MinSOC={min_soc:.2f}%"
+                        f"{LogColor.RESET}"
+                    )
+
+                    break
+
+                # =================================================================
+                # 11.8 BLOCK DISCHARGING
+                # =================================================================
 
                 if block_discharging:
 
@@ -5203,482 +6341,295 @@ class ScheduleStrategy:
                         f"{LogColor.RESET}"
                     )
 
-                    return [{
-                        "status": "no_action",
-                        "reason": "discharging_blocked",
-                        "soc": current_soc,
-                        "timestamp": datetime.now().isoformat(),
-                    }]
+                    break
 
-                if current_soc <= min_soc:
+                # =================================================================
+                # 11.9 LIVE REQUIRED DISCHARGE
+                # =================================================================
+                #
+                # Grid power is the import at POI.
+                #
+                # If:
+                #
+                #     Grid = 4500 kW
+                #     Limit = 4000 kW
+                #
+                # required discharge = 500 kW
+                #
+                # If Grid is already <= limit:
+                #
+                # required discharge = 0
+                #
+                # =================================================================
 
-                    logger.warning(
-                        f"{LogColor.RED}"
+                if event_grid_import_limit_kw is not None:
+
+                    remaining_excess_kw = max(
+                        0.0,
+                        grid_power
+                        - event_grid_import_limit_kw
+                    )
+
+                    grid_target_kw = (
+                        event_grid_import_limit_kw
+                    )
+
+                else:
+
+                    remaining_excess_kw = max(
+                        0.0,
+                        grid_power
+                        - event_target_limit_kw
+                    )
+
+                    grid_target_kw = (
+                        event_target_limit_kw
+                    )
+
+                logger.info(
+                    f"[PeakShavingDischarge] "
+                    f"Grid={grid_power:.2f} kW | "
+                    f"Target={grid_target_kw:.2f} kW | "
+                    f"RemainingExcess={remaining_excess_kw:.2f} kW"
+                )
+
+                # =================================================================
+                # 11.10 TARGET ALREADY ACHIEVED
+                # =================================================================
+
+                # if remaining_excess_kw <= 0:
+
+                #     logger.info(
+                #         f"{LogColor.GREEN}"
+                #         f"[PeakShavingDischarge] "
+                #         f"Grid target achieved. "
+                #         f"Grid={grid_power:.2f} kW <= "
+                #         f"Target={grid_target_kw:.2f} kW"
+                #         f"{LogColor.RESET}"
+                #     )
+
+                #     break
+
+                # =================================================================
+                # 11.11 DETERMINE NEXT DISCHARGE
+                # =================================================================
+                #
+                # IMPORTANT:
+                #
+                # Event is the upper authority.
+                #
+                # We cannot exceed event_discharge_kw.
+                #
+                # But if live grid requires less discharge, reduce it.
+                #
+                # =================================================================
+
+                requested_discharge_kw = max(
+                    current_load_kw - pv_power_kw - (
+                        0.0
+                        if fault_code > 0 and FaultCode(fault_code).name == "GRID_LOSS"
+                        else event_target_grid_import_kw
+                    ),
+                    remaining_excess_kw,
+                )
+
+                # =================================================================
+                # APPLY BATTERY LIMITS
+                # =================================================================
+
+                next_setpoint_kw = max(
+                    0.0,
+                    min(
+                        requested_discharge_kw,
+                        max_discharge_kw,
+                        max_usable_kw,
+                    )
+                )
+
+                # =================================================================
+                # HANDLE POWER SHORTFALL
+                # =================================================================
+
+                shortfall_kw = max(
+                    0.0,
+                    requested_discharge_kw - next_setpoint_kw
+                )
+
+                if shortfall_kw == 0:
+                    shortfall_kw = (current_load_kw - self.carry_capacity) if (current_load_kw - next_setpoint_kw) <= self.carry_capacity else 0.0
+                    logger.info(f"Extra Load Detected {shortfall_kw} kW")
+
+                # Initialize defaults to avoid UnboundLocalError
+                grid_support_kw = 0.0
+                remaining_shortfall_kw = 0.0
+
+                if shortfall_kw > 0 and fault_code == 0:
+
+                    available_grid_headroom_kw = max(
+                        0.0,
+                        event_grid_import_limit_kw - event_target_grid_import_kw
+                    )
+
+                    grid_support_kw = min(
+                        shortfall_kw,
+                        available_grid_headroom_kw
+                    )
+
+                    event_target_grid_import_kw += grid_support_kw
+
+                    remaining_shortfall_kw = shortfall_kw - grid_support_kw
+
+                    if remaining_shortfall_kw > 0:
+
+                        await self.reduce_load(
+                            reduction_percentage=(remaining_shortfall_kw/self.peak_load * 100),
+                            channel=channel,
+                            server_ip=server_ip,
+                            server_port=server_port,
+                            slave_id=slave_id,
+                            device_id=device_id,
+                        )
+
+                        logger.info(
+                            f"{LogColor.YELLOW}"
+                            f"[PeakShavingDischarge] Insufficient battery and grid capacity. "
+                            f"Applying load shedding of {remaining_shortfall_kw:.2f} kW."
+                            f"{LogColor.RESET}"
+                        )
+
+                logger.info(
+                    f"[PeakShavingDischarge] "
+                    f"EventLimit={event_discharge_kw:.2f} kW | "
+                    f"GridRequired={remaining_excess_kw:.2f} kW | "
+                    f"MaxDischarge={max_discharge_kw:.2f} kW | "
+                    f"MaxUsable={max_usable_kw:.2f} kW | "
+                    f"NextSetpoint={next_setpoint_kw:.2f} kW | "
+                    f"GridTarget={event_target_grid_import_kw:.2f} kW | "
+                    f"GridSupport={grid_support_kw:.2f} kW | "
+                    f"LoadShed={remaining_shortfall_kw:.2f} kW"
+                )
+
+                # =================================================================
+                # 11.13 NOTHING AVAILABLE
+                # =================================================================
+
+                # if next_setpoint_kw <= 0:
+
+                #     logger.warning(
+                #         f"{LogColor.YELLOW}"
+                #         f"[PeakShavingDischarge] "
+                #         f"No usable discharge power available."
+                #         f"{LogColor.RESET}"
+                #     )
+
+                #     break
+
+                # =================================================================
+                # 11.14 UPDATE SETPOINT
+                # =================================================================
+
+                if int(next_setpoint_kw) != int(last_setpoint):
+
+                    slot_number += 1
+
+                    logger.info(
+                        f"{LogColor.MAGENTA}"
                         f"[PeakShavingDischarge] "
-                        f"Minimum SOC already reached."
+                        f"Updating discharge setpoint "
+                        f"{last_setpoint:.2f} -> "
+                        f"{next_setpoint_kw:.2f} kW | "
+                        f"Slot={slot_number}"
                         f"{LogColor.RESET}"
                     )
 
-                    return [{
-                        "status": "completed",
-                        "reason": "min_soc_reached",
-                        "soc": current_soc,
-                        "timestamp": datetime.now().isoformat(),
-                    }]
-
-                if initial_setpoint_kw <= 0:
-
-                    logger.info(
-                        "[PeakShavingDischarge] "
-                        "No discharge currently required."
+                    await _execute_slot_async_discharge(
+                        resolver=resolver,
+                        setpoint_kw=int(next_setpoint_kw),
+                        channel_id=channel,
+                        server_ip=server_ip,
+                        server_port=server_port,
+                        slave_id=slave_id,
+                        device_id=device_id,
+                        slot_number=slot_number,
+                        extra_info={
+                            **extra_info,
+                            "strategy_id": 7,
+                            "event_decision": event_decision,
+                            "event_discharge_kw": event_discharge_kw,
+                            "event_target_soc": event_target_soc,
+                            "event_target_energy_mwh": event_target_energy_mwh,
+                        },
                     )
 
-                    return [{
-                        "status": "no_action",
-                        "reason": "no_live_discharge_required",
+                    last_setpoint = next_setpoint_kw
+
+                    results.append({
                         "soc": current_soc,
                         "battery_energy_mwh": current_energy_mwh,
-                        "discharge_kw": 0,
+                        "discharge_kw": next_setpoint_kw,
+                        "grid_power_kw": grid_power,
+                        "remaining_excess_kw": remaining_excess_kw,
+                        "decision": event_decision,
                         "timestamp": datetime.now().isoformat(),
-                    }]
+                    })
 
-                # =====================================================================
-                # 10. FIRST WRITE
-                # =====================================================================
+                    await asyncio.sleep(5)
 
-                last_setpoint = initial_setpoint_kw
+            # =====================================================================
+            # 12. NORMAL EXIT
+            # =====================================================================
 
-                logger.info(
-                    f"{LogColor.MAGENTA}"
-                    f"[PeakShavingDischarge] "
-                    f"WRITE FIRST SETPOINT = "
-                    f"{initial_setpoint_kw:.2f} kW"
-                    f"{LogColor.RESET}"
-                )
+            logger.info(
+                "[PeakShavingDischarge] "
+                "Discharge loop completed."
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"{LogColor.RED}"
+                f"[PeakShavingDischarge] "
+                f"Error while executing discharge strategy: {e}"
+                f"{LogColor.RESET}"
+            )
+
+            results.append({
+                "status": "error",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        finally:
+
+            # =====================================================================
+            # 13. ALWAYS STOP DISCHARGE
+            # =====================================================================
+
+            logger.info(
+                f"{LogColor.MAGENTA}"
+                f"[PeakShavingDischarge] "
+                f"STOPPING DISCHARGE."
+                f"{LogColor.RESET}"
+            )
+
+            try:
 
                 await _execute_slot_async_discharge(
                     resolver=resolver,
-                    setpoint_kw=int(-initial_setpoint_kw),
+                    setpoint_kw=0,
                     channel_id=channel,
                     server_ip=server_ip,
                     server_port=server_port,
                     slave_id=slave_id,
                     device_id=device_id,
-                    slot_number=1,
+                    slot_number=200,
                     extra_info={
                         **extra_info,
                         "strategy_id": 7,
                         "event_decision": event_decision,
-                        "event_discharge_kw": event_discharge_kw,
-                        "event_target_soc": event_target_soc,
-                        "event_target_energy_mwh": event_target_energy_mwh,
+                        "final_soc": current_soc,
+                        "final_battery_energy_mwh": current_energy_mwh,
                     },
-                )
-
-                results.append({
-                    "soc": current_soc,
-                    "battery_energy_mwh": current_energy_mwh,
-                    "discharge_kw": initial_setpoint_kw,
-                    "decision": event_decision,
-                    "timestamp": datetime.now().isoformat(),
-                })
-
-                # =====================================================================
-                # 11. DISCHARGE LOOP
-                # =====================================================================
-
-                logger.info(
-                    "[PeakShavingDischarge] Entering discharge loop."
-                )
-
-                await asyncio.sleep(5)
-
-                while True:
-                    # =================================================================
-                    # 10.1 MAXIMUM EXECUTION TIME CHECK
-                    # =================================================================
-
-                    elapsed = time.monotonic() - start_time
-
-                    if elapsed >= MAX_EXECUTION_SECONDS:
-
-                        logger.warning(
-                            f"{LogColor.YELLOW}"
-                            f"[PeakShavingCharging] 15-minute execution limit reached. "
-                            f"Elapsed={elapsed:.1f} seconds. Stopping charging loop."
-                            f"{LogColor.RESET}"
-                        )
-
-                        break
-                    await asyncio.sleep(1)
-
-                    # =================================================================
-                    # 11.1 LOAD LIVE CONFIG
-                    # =================================================================
-
-                    try:
-
-                        config = await ScheduleStrategy.bess_decision(
-                            device_id,
-                            poi_meter_id
-                        )
-
-                        (
-                            block_discharging,
-                            pv_power_kw,
-                            bess_power_kw,
-                            live_soc,
-                            current_load_kw,
-                            min_soc,
-                            max_discharge_kw,
-                            max_usable_kw,
-                            efficiency,
-                            fault_code,
-                        ) = (
-                            config["block_discharging"],
-                            config["pv_power_kw"],
-                            config["bess_power_kw"],
-                            config["soc"],
-                            config["current_load_kw"],
-                            config["min_soc"],
-                            config["max_discharge_kw"],
-                            config["max_usable_kw"],
-                            config["efficiency"],
-                            config["fault_code"]
-                        )
-
-                    except Exception as e:
-
-                        logger.error(
-                            f"{LogColor.RED}"
-                            f"[PeakShavingDischarge] "
-                            f"Error loading live parameters: {e}"
-                            f"{LogColor.RESET}"
-                        )
-
-                        # break
-                        await asyncio.sleep(1)  # Wait before retrying
-                        continue
-
-                    # =================================================================
-                    # 11.2 LIVE VALUES
-                    # =================================================================
-
-                    if fault_code > 0:
-                        self.fault = fault_code
-                        # break
-
-                    current_soc = float(
-                        live_soc
-                    )
-
-                    min_soc = float(
-                        min_soc
-                    )
-
-                    max_discharge_kw = float(
-                        max_discharge_kw or 0
-                    )
-
-                    max_usable_kw = float(
-                        max_usable_kw or 0
-                    )
-
-                    pv_power_kw = self.pv_kw
-                    current_load_kw = self.load_kw
-
-                    bess_power_kw = float(
-                        bess_power_kw or 0
-                    )
-
-                    live_data = resolver.get_latest_device_data(
-                        device_id
-                    )
-
-                    current_energy_mwh = get_battery_energy_mwh(
-                        live_data,
-                        current_soc
-                    )
-
-                    # =================================================================
-                    # 11.3 LIVE GRID POWER
-                    # =================================================================
-
-                    grid_power = (
-                        current_load_kw
-                        - pv_power_kw
-                        - bess_power_kw
-                    )
-
-                    # =================================================================
-                    # 11.4 LOG
-                    # =================================================================
-
-                    logger.info(
-                        f"[PeakShavingDischarge] "
-                        f"SOC={current_soc:.2f}% | "
-                        f"Energy={current_energy_mwh:.3f} MWh | "
-                        f"Load={current_load_kw:.2f} kW | "
-                        f"PV={pv_power_kw:.2f} kW | "
-                        f"BESS={bess_power_kw:.2f} kW | "
-                        f"Grid={grid_power:.2f} kW | "
-                        f"Setpoint={last_setpoint:.2f} kW"
-                    )
-
-                    # =================================================================
-                    # 11.5 TARGET SOC
-                    # =================================================================
-
-                    # if (
-                    #     event_target_soc is not None
-                    #     and current_soc <= event_target_soc
-                    # ):
-
-                    #     logger.info(
-                    #         f"{LogColor.GREEN}"
-                    #         f"[PeakShavingDischarge] "
-                    #         f"Event target SOC reached. "
-                    #         f"Current={current_soc:.2f}% | "
-                    #         f"Target={event_target_soc:.2f}%"
-                    #         f"{LogColor.RESET}"
-                    #     )
-
-                    #     break
-
-                    # =================================================================
-                    # 11.6 TARGET ENERGY
-                    # =================================================================
-
-                    if (
-                        event_target_energy_mwh is not None
-                        and current_energy_mwh <= event_target_energy_mwh
-                    ):
-
-                        logger.info(
-                            f"{LogColor.GREEN}"
-                            f"[PeakShavingDischarge] "
-                            f"Event target energy reached. "
-                            f"Current={current_energy_mwh:.3f} MWh | "
-                            f"Target={event_target_energy_mwh:.3f} MWh"
-                            f"{LogColor.RESET}"
-                        )
-
-                        break
-
-                    # =================================================================
-                    # 11.7 MINIMUM SOC
-                    # =================================================================
-
-                    if current_soc <= min_soc:
-
-                        logger.warning(
-                            f"{LogColor.RED}"
-                            f"[PeakShavingDischarge] "
-                            f"Minimum SOC reached. "
-                            f"SOC={current_soc:.2f}% | "
-                            f"MinSOC={min_soc:.2f}%"
-                            f"{LogColor.RESET}"
-                        )
-
-                        break
-
-                    # =================================================================
-                    # 11.8 BLOCK DISCHARGING
-                    # =================================================================
-
-                    if block_discharging:
-
-                        logger.warning(
-                            f"{LogColor.RED}"
-                            f"[PeakShavingDischarge] "
-                            f"Discharging blocked by live configuration."
-                            f"{LogColor.RESET}"
-                        )
-
-                        break
-
-                    # =================================================================
-                    # 11.9 LIVE REQUIRED DISCHARGE
-                    # =================================================================
-                    #
-                    # Grid power is the import at POI.
-                    #
-                    # If:
-                    #
-                    #     Grid = 4500 kW
-                    #     Limit = 4000 kW
-                    #
-                    # required discharge = 500 kW
-                    #
-                    # If Grid is already <= limit:
-                    #
-                    # required discharge = 0
-                    #
-                    # =================================================================
-
-                    if event_grid_import_limit_kw is not None:
-
-                        remaining_excess_kw = max(
-                            0.0,
-                            grid_power
-                            - event_grid_import_limit_kw
-                        )
-
-                        grid_target_kw = (
-                            event_grid_import_limit_kw
-                        )
-
-                    else:
-
-                        remaining_excess_kw = max(
-                            0.0,
-                            grid_power
-                            - event_target_limit_kw
-                        )
-
-                        grid_target_kw = (
-                            event_target_limit_kw
-                        )
-
-                    logger.info(
-                        f"[PeakShavingDischarge] "
-                        f"Grid={grid_power:.2f} kW | "
-                        f"Target={grid_target_kw:.2f} kW | "
-                        f"RemainingExcess={remaining_excess_kw:.2f} kW"
-                    )
-
-                    # =================================================================
-                    # 11.10 TARGET ALREADY ACHIEVED
-                    # =================================================================
-
-                    # if remaining_excess_kw <= 0:
-
-                    #     logger.info(
-                    #         f"{LogColor.GREEN}"
-                    #         f"[PeakShavingDischarge] "
-                    #         f"Grid target achieved. "
-                    #         f"Grid={grid_power:.2f} kW <= "
-                    #         f"Target={grid_target_kw:.2f} kW"
-                    #         f"{LogColor.RESET}"
-                    #     )
-
-                    #     break
-
-                    # =================================================================
-                    # 11.11 DETERMINE NEXT DISCHARGE
-                    # =================================================================
-                    #
-                    # IMPORTANT:
-                    #
-                    # Event is the upper authority.
-                    #
-                    # We cannot exceed event_discharge_kw.
-                    #
-                    # But if live grid requires less discharge, reduce it.
-                    #
-                    # =================================================================
-
-                    requested_discharge_kw = max(      # max
-                        # event_discharge_kw,
-                        current_load_kw - pv_power_kw,
-                        remaining_excess_kw,
-                    )
-
-                    # =================================================================
-                    # 11.12 APPLY BATTERY LIMITS
-                    # =================================================================
-
-                    next_setpoint_kw = min(
-                        requested_discharge_kw,
-                        max_discharge_kw,
-                        max_usable_kw,
-                    )
-
-                    next_setpoint_kw = max(
-                        0.0,
-                        next_setpoint_kw
-                    )
-
-                    logger.info(
-                        f"[PeakShavingDischarge] "
-                        f"EventLimit={event_discharge_kw:.2f} kW | "
-                        f"GridRequired={remaining_excess_kw:.2f} kW | "
-                        f"MaxDischarge={max_discharge_kw:.2f} kW | "
-                        f"MaxUsable={max_usable_kw:.2f} kW | "
-                        f"NextSetpoint={next_setpoint_kw:.2f} kW"
-                    )
-
-                    # =================================================================
-                    # 11.13 NOTHING AVAILABLE
-                    # =================================================================
-
-                    if next_setpoint_kw <= 0:
-
-                        logger.warning(
-                            f"{LogColor.YELLOW}"
-                            f"[PeakShavingDischarge] "
-                            f"No usable discharge power available."
-                            f"{LogColor.RESET}"
-                        )
-
-                        break
-
-                    # =================================================================
-                    # 11.14 UPDATE SETPOINT
-                    # =================================================================
-
-                    if int(next_setpoint_kw) != int(last_setpoint):
-
-                        slot_number += 1
-
-                        logger.info(
-                            f"{LogColor.MAGENTA}"
-                            f"[PeakShavingDischarge] "
-                            f"Updating discharge setpoint "
-                            f"{last_setpoint:.2f} -> "
-                            f"{next_setpoint_kw:.2f} kW | "
-                            f"Slot={slot_number}"
-                            f"{LogColor.RESET}"
-                        )
-
-                        await _execute_slot_async_discharge(
-                            resolver=resolver,
-                            setpoint_kw=int(-next_setpoint_kw),
-                            channel_id=channel,
-                            server_ip=server_ip,
-                            server_port=server_port,
-                            slave_id=slave_id,
-                            device_id=device_id,
-                            slot_number=slot_number,
-                            extra_info={
-                                **extra_info,
-                                "strategy_id": 7,
-                                "event_decision": event_decision,
-                                "event_discharge_kw": event_discharge_kw,
-                                "event_target_soc": event_target_soc,
-                                "event_target_energy_mwh": event_target_energy_mwh,
-                            },
-                        )
-
-                        last_setpoint = next_setpoint_kw
-
-                        results.append({
-                            "soc": current_soc,
-                            "battery_energy_mwh": current_energy_mwh,
-                            "discharge_kw": next_setpoint_kw,
-                            "grid_power_kw": grid_power,
-                            "remaining_excess_kw": remaining_excess_kw,
-                            "decision": event_decision,
-                            "timestamp": datetime.now().isoformat(),
-                        })
-
-                # =====================================================================
-                # 12. NORMAL EXIT
-                # =====================================================================
-
-                logger.info(
-                    "[PeakShavingDischarge] "
-                    "Discharge loop completed."
                 )
 
             except Exception as e:
@@ -5686,57 +6637,9 @@ class ScheduleStrategy:
                 logger.error(
                     f"{LogColor.RED}"
                     f"[PeakShavingDischarge] "
-                    f"Error while executing discharge strategy: {e}"
+                    f"Failed to stop discharge: {e}"
                     f"{LogColor.RESET}"
                 )
-
-                results.append({
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.now().isoformat(),
-                })
-
-            finally:
-
-                # =====================================================================
-                # 13. ALWAYS STOP DISCHARGE
-                # =====================================================================
-
-                logger.info(
-                    f"{LogColor.MAGENTA}"
-                    f"[PeakShavingDischarge] "
-                    f"STOPPING DISCHARGE."
-                    f"{LogColor.RESET}"
-                )
-
-                try:
-
-                    await _execute_slot_async_discharge(
-                        resolver=resolver,
-                        setpoint_kw=0,
-                        channel_id=channel,
-                        server_ip=server_ip,
-                        server_port=server_port,
-                        slave_id=slave_id,
-                        device_id=device_id,
-                        slot_number=200,
-                        extra_info={
-                            **extra_info,
-                            "strategy_id": 7,
-                            "event_decision": event_decision,
-                            "final_soc": current_soc,
-                            "final_battery_energy_mwh": current_energy_mwh,
-                        },
-                    )
-
-                except Exception as e:
-
-                    logger.error(
-                        f"{LogColor.RED}"
-                        f"[PeakShavingDischarge] "
-                        f"Failed to stop discharge: {e}"
-                        f"{LogColor.RESET}"
-                    )
 
             # =====================================================================
             # 14. FINAL RESULT
@@ -5754,191 +6657,6 @@ class ScheduleStrategy:
             })
 
             return results
-
-    async def PP_PeakShavingDischargeStrategyType7(
-        self,
-        resolver,
-        controller_static,
-        device_id: str,
-        channel,
-        server_ip,
-        server_port,
-        slave_id,
-        excess_load: float,
-        poi_meter_id: str,
-        target_limit: float,
-        authority: str = "internal",
-        extra_info: dict = None,
-    ):
-        """
-        Loop-based peak shaving discharge strategy.
-        Discharge continuously until target load is shaved.
-
-        excess_load = load - threshold (positive = need discharge)
-        """
-
-        try:
-
-            logger.info(f"{LogColor.MAGENTA} Peak Shaving Discharge STARTED {LogColor.RESET}")
-
-            results = []
-
-            setpoint_kw = excess_load
-
-            # ---------------------------
-            # FIRST WRITE
-            # ---------------------------
-
-            logger.info(
-                f"{LogColor.MAGENTA}WRITE FIRST SETPOINT = {setpoint_kw:.2f} kW{LogColor.RESET}"
-            )
-
-            await _execute_slot_async_discharge(
-                resolver=resolver,
-                setpoint_kw=int(setpoint_kw),
-                channel_id=channel,
-                server_ip=server_ip,
-                server_port=server_port,
-                slave_id=slave_id,
-                device_id=device_id,
-                slot_number=1,
-                extra_info={"strategy_id": 3},
-            )
-
-            # ---------------------------
-            # LOOP UNTIL TARGET SHAVED
-            # ---------------------------
-            logger.info(" ENTERING DISCHARGE LOOP ...")
-
-            while True:
-                await asyncio.sleep(1)  # polling interval
-
-                poi_meter_id = "plant_1_poi_meter_1"
-                try:
-                    config = await ScheduleStrategy.bess_decision(device_id, poi_meter_id)
-                    (
-                        block_discharging,
-                        pv_power_kw,
-                        bess_power_kw,
-                        dg_power_kw,
-                        soc,
-                        current_load_kw,
-                        min_soc,
-                        max_discharge_kw,
-                        max_usable_kw,
-                        efficiency
-                    ) = (
-                        config["block_discharging"],
-                        config["pv_power_kw"],
-                        config["bess_power_kw"],
-                        config["dg_power_kw"],
-                        config["soc"],
-                        config["current_load_kw"],
-                        config["min_soc"],
-                        config["max_discharge_kw"],
-                        config["max_usable_kw"],
-                        config["efficiency"],
-                    )
-                except Exception as e:
-                    logger.info(f"{LogColor.RED} Error loading live params: {e} {LogColor.RESET}")
-                    return
-                
-                if block_discharging:
-                    logger.warning(f"{LogColor.RED} Discharging blocked by live config! {LogColor.RESET}")
-                    break
-
-                grid_power = current_load_kw - pv_power_kw - bess_power_kw - dg_power_kw
-
-                remaining_excess = grid_power - target_limit
-
-                # remaining_excess = excess_load - battery_power #current_load - # Condition will varify
-                logger.info(
-                    f"SOC={soc:.1f}% | Load={current_load_kw:.2f} | BESS Power={int(bess_power_kw)} | Setpoint={int(setpoint_kw)} | Grid Power={grid_power:.2f} | Remaining Excess={remaining_excess:.2f}"
-                )
-
-                # safety exit conditions
-                if soc <= min_soc:
-                    logger.warning("MIN SOC reached, stopping discharge.")
-                    break
-
-                if remaining_excess < 0 and (grid_power + int(setpoint_kw)) < target_limit:
-                    logger.info("Target achieved — load shaved.")
-                    break
-
-                # compute next setpoint
-                if abs(int(bess_power_kw)) == abs(int(setpoint_kw)) and remaining_excess != 0:
-
-                    nwe_required_kw = (abs(setpoint_kw) + remaining_excess)
-
-                    next_kw = min(nwe_required_kw, max_discharge_kw, max_usable_kw)
-
-                    # limit
-                    if abs(next_kw) > max_usable_kw:
-                        logger.info(f"New Required Power {nwe_required_kw:.2f} kW is more than Usable Power {max_usable_kw:.2f} kW")
-                        break   # Depends on Strategies, in this DG is present so other decision maybe much usefull.
-
-                    if abs(next_kw) == 0 and abs(setpoint_kw) == 0:
-                        break
-
-                    if int(next_kw) != int(setpoint_kw):
-
-                        logger.info(f"WRITE NEW SETPOINT = {next_kw:.2f} kW")
-
-                        await _execute_slot_async_discharge(
-                            resolver=resolver,
-                            setpoint_kw=int(-next_kw),
-                            channel_id=channel,
-                            server_ip=server_ip,
-                            server_port=server_port,
-                            slave_id=slave_id,
-                            device_id=device_id,
-                            slot_number=1,
-                            extra_info={"strategy_id": 3},
-                        )
-
-                        setpoint_kw = next_kw
-
-                        results.append(
-                            {
-                                "setpoint": int(next_kw),
-                                "soc": soc,
-                                "load": current_load_kw,
-                                "timestamp": datetime.now().isoformat(),
-                            }
-                        )
-
-            # ---------------------------
-            # FINAL STOP
-            # ---------------------------
-            logger.info("STOPPING PEAK SHAVING DISCHARGE")
-
-            await _execute_slot_async_discharge(
-                resolver=resolver,
-                setpoint_kw=0,
-                channel_id=channel,
-                server_ip=server_ip,
-                server_port=server_port,
-                slave_id=slave_id,
-                device_id=device_id,
-                slot_number=200,
-                extra_info={"strategy_id": 3},
-            )
-
-            results.append(
-                {
-                    "setpoint": 0,
-                    "soc": soc,
-                    "load": current_load_kw,
-                    "timestamp": datetime.now().isoformat(),
-                    "final": True,
-                }
-            )
-
-            return results
-
-        except Exception as e:
-            logger.info(f"{LogColor.RED} Error While Executing [PeakShavingDischargeStrategy]. {e} {LogColor.RESET}")
-            return {"error": f"Error While Executing [PeakShavingDischargeStrategy]. {e}"}
 
     async def event_generator(
         self,
@@ -6164,15 +6882,15 @@ async def _execute_slot_async_charging(
         if slot_number == 200:
             logger.info(f"{color}[Slot {slot_number}] Writing PowerMode=0 to reg {power_mode_register}{LogColor.RESET}")
             # Step 3: set external control mode
-            await ModbusWriter.write_to_register(
-                channel_id=channel_id,
-                server_ip=server_ip,
-                server_port=server_port,
-                slave_id=slave_id,
-                register=power_mode_register,
-                data_type=power_mode_data_type,
-                value=0
-            )
+            # await ModbusWriter.write_to_register(
+            #     channel_id=channel_id,
+            #     server_ip=server_ip,
+            #     server_port=server_port,
+            #     slave_id=slave_id,
+            #     register=power_mode_register,
+            #     data_type=power_mode_data_type,
+            #     value=0
+            # )
 
             # sp_rec = SetpointWrite(strategy_id=extra_info.get("strategy_id", 0), timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), register_mode=0, setpoint_value=setpoint_kw, unit="kW", device_id=device_id, success=True, response_text="Power mode is closed!")
             # pool = await get_async_connection()
@@ -6248,15 +6966,15 @@ async def _execute_slot_async_discharge(
         if slot_number == 200:
             logger.info(f"{color}[Slot {slot_number}] Writing PowerMode=0 to reg {power_mode_register}{LogColor.RESET}")
             # Step 3: set external control mode
-            await ModbusWriter.write_to_register(
-                channel_id=channel_id,
-                server_ip=server_ip,
-                server_port=server_port,
-                slave_id=slave_id,
-                register=power_mode_register,
-                data_type=power_mode_data_type,
-                value=0
-            )
+            # await ModbusWriter.write_to_register(
+            #     channel_id=channel_id,
+            #     server_ip=server_ip,
+            #     server_port=server_port,
+            #     slave_id=slave_id,
+            #     register=power_mode_register,
+            #     data_type=power_mode_data_type,
+            #     value=0
+            # )
 
             # sp_rec = SetpointWrite(strategy_id=extra_info.get("strategy_id", 0), timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), register_mode=0, setpoint_value=setpoint_kw, unit="kW", device_id=device_id, success=True, response_text="Power mode is closed!")
             # pool = await get_async_connection()
@@ -6266,6 +6984,131 @@ async def _execute_slot_async_discharge(
 
     except Exception as e:
         logger.error(f"{color}[Slot {slot_number}] Failed to write setpoint: {e}{LogColor.RESET}")
+
+
+
+
+
+async def _execute_distributed_load_value_writer(
+    resolver,
+    total_load_kw: float,
+    load_blocks: dict,
+    channel_id: str,
+    server_ip: str,
+    server_port: int,
+    slave_id: int,
+    device_id: str,
+):
+
+    data = resolver.get_latest_device_data(device_id)
+
+    logger.info("=" * 80)
+    logger.info(
+        f"[LOAD DISTRIBUTION] WRITING LIVE BLOCK LOADS | "
+        f"Total Load={total_load_kw:.2f} kW"
+    )
+
+    # Calculate group totals for logging
+    ev_total = (
+        load_blocks["EV1"] +
+        load_blocks["EV2"]
+    )
+
+    chiller_total = (
+        load_blocks["CHILLER1"] +
+        load_blocks["CHILLER2"]
+    )
+
+    cooling_tower_total = (
+        load_blocks["COOLING_TOWER1"] +
+        load_blocks["COOLING_TOWER2"]
+    )
+
+    service_total = load_blocks["SERVICE_BLOCK"]
+
+    # Validate total load consistency
+    calculated_total = sum(load_blocks.values())
+
+    if abs(calculated_total - total_load_kw) > 0.01:
+        raise ValueError(
+            f"Load mismatch | "
+            f"Blocks={calculated_total:.2f} kW | "
+            f"Total={total_load_kw:.2f} kW"
+        )
+
+    # Direct block-to-register mapping
+    distributed_values = {
+
+        Tags.EV_STACK_LOAD_1: load_blocks["EV1"],
+        Tags.EV_STACK_LOAD_2: load_blocks["EV2"],
+
+        Tags.CHILLER_LOAD_1: load_blocks["CHILLER1"],
+        Tags.CHILLER_LOAD_2: load_blocks["CHILLER2"],
+
+        Tags.COOLING_TOWER_LOAD_1: load_blocks["COOLING_TOWER1"],
+        Tags.COOLING_TOWER_LOAD_2: load_blocks["COOLING_TOWER2"],
+
+        Tags.SERVICE_BLOCK_LOAD_1: service_total / 2,
+        Tags.SERVICE_BLOCK_LOAD_2: service_total / 2,
+
+        Tags.Load: total_load_kw,
+    }
+
+    logger.info(
+        f"[LOAD DISTRIBUTION] EV={ev_total:.2f} kW | "
+        f"CHILLER={chiller_total:.2f} kW | "
+        f"COOLING TOWER={cooling_tower_total:.2f} kW | "
+        f"SERVICE={service_total:.2f} kW"
+    )
+
+    for block, value in load_blocks.items():
+
+        logger.info(
+            f"[LOAD DISTRIBUTION] {block}={value:.2f} kW"
+        )
+
+    # Write all distributed values
+    for tag, value in distributed_values.items():
+
+        try:
+
+            register_info = data[tag]
+
+            register = register_info["register"]
+            data_type = register_info["dataType"]
+
+            await ModbusWriter.write_to_register(
+                channel_id=channel_id,
+                server_ip=server_ip,
+                server_port=server_port,
+                slave_id=slave_id,
+                register=register,
+                data_type=data_type,
+                value=float(value)
+            )
+
+            logger.info(
+                f"[LOAD DISTRIBUTION] WRITE SUCCESS | "
+                f"Tag={tag} | "
+                f"Register={register} | "
+                f"Value={value:.2f} kW"
+            )
+
+        except Exception:
+
+            logger.exception(
+                f"[LOAD DISTRIBUTION] WRITE FAILED | "
+                f"Tag={tag} | "
+                f"Value={value:.2f} kW"
+            )
+
+            raise
+
+    logger.info(
+        "[LOAD DISTRIBUTION] All live block values written."
+    )
+
+    logger.info("=" * 80)
 
 
 async def _execute_load_value_writer(
