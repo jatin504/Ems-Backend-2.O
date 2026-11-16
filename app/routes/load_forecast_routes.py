@@ -41,7 +41,7 @@ async def get_load_and_schedule():
 
     Response contains:
       - forecast: raw load forecast points list
-      - schedule: minute-wise provisional schedule rows
+      - schedule: 15-minute provisional schedule rows
       - chart_series: timestamped provisional values
       - summary: total_charge_kwh, total_discharge_kwh, net_discharge_kwh, peak_load_kw
     """
@@ -95,7 +95,7 @@ async def get_load_and_schedule():
                         raise OSError("Could not save sample window forecast")
                     strategy = ScheduleStrategy(resolver=DeviceConfigResolver(), sample_data=samples)
                     schedule = await strategy.prepare_ems_plan_schedule()
-                    await save_provisional_schedule(points, samples, schedule, model_name)
+                    await save_provisional_schedule(points, schedule, model_name)
                     source = "forecast_microservice"
 
         first_day = target_date or today
@@ -121,8 +121,8 @@ async def get_load_and_schedule():
                 chart_series[name].append([timestamp, row[column]])
             chart_series["charge"].append([timestamp, round(row["charge_kw"] + row["grid_charge_kw"], 2)])
 
-        charge_kwh = sum(value for _, value in chart_series["charge"]) / 60
-        discharge_kwh = sum(value for _, value in chart_series["discharge"]) / 60
+        charge_kwh = sum(value for _, value in chart_series["charge"]) / 4
+        discharge_kwh = sum(value for _, value in chart_series["discharge"]) / 4
         return jsonify({
             "status": "success",
             "date": target_date.isoformat() if target_date else "all",

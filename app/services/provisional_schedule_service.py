@@ -4,21 +4,22 @@ from app.services.load_forecast_services import ensure_load_forecast_table, save
 from app.utils.db_utils import DB
 
 
-async def save_provisional_schedule(forecast, samples, schedule, model_name):
-    """Pair each minute input with the planned setpoints in result.json."""
-    slots = {datetime.fromisoformat(slot["time_stamp"]): slot for slot in schedule}
-    rows = {}
-    for sample in samples:
-        minute = datetime.fromisoformat(sample["time_stamp"]).replace(second=0, microsecond=0)
-        slot = slots[minute.replace(minute=minute.minute // 15 * 15)]
+async def save_provisional_schedule(forecast, schedule, model_name):
+    """Save one row per planned slot using the averages of its minute windows."""
+    rows = []
+    for slot in schedule:
         charge = slot["charge_kw"]
         grid_charge = slot["grid_charge_kw"]
         discharge = slot["discharge_kw"]
-        rows[minute] = (
-            minute, model_name, sample["poa"], sample["pv_kw"], sample["load_kw"],
+        poa, pv, load = (
+            round(sum(slot[key]) / len(slot[key]), 2)
+            for key in ("poa_window", "pv_window", "window_load")
+        )
+        rows.append((
+            datetime.fromisoformat(slot["time_stamp"]), model_name, poa, pv, load,
             charge, grid_charge, discharge, slot["decision"],
             round(discharge - charge - grid_charge, 2), slot["grid_import_kw"],
-        )
+        ))
 
     if not rows:
         return
@@ -44,7 +45,7 @@ async def save_provisional_schedule(forecast, samples, schedule, model_name):
                     bess_mode = EXCLUDED.bess_mode,
                     bess_power_kw = EXCLUDED.bess_power_kw,
                     grid_import_kw = EXCLUDED.grid_import_kw
-            """, list(rows.values()))
+            """, rows)
 
 
 async def get_provisional_schedule(first_day, last_day, model_name):
