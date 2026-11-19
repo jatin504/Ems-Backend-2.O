@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 from plant_architecture_resolver import PlantArchitectureResolver
-from utils.db_write_queue import DB_WRITE_QUEUE, VICTORIA_DB_WRITE_QUEUE
+from utils.db_write_queue import get_timeseries_write_queue
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ class AggState:
 class ResolutionSampling:
 
     def __init__(self):
+        self.write_queue = get_timeseries_write_queue()
         # device -> resolution -> tag -> [(value, aggregation)]
         self.raw_buffers = defaultdict(
             lambda: defaultdict(
@@ -292,10 +293,8 @@ class ResolutionSampling:
                     )
 
                 if batch:
-                    # await DB_WRITE_QUEUE.put(batch)
-                    # Historical output: the Victoria worker consumes this queue.
                     # Queueing a batch is not confirmation of a database insert.
-                    await VICTORIA_DB_WRITE_QUEUE.put(batch)
+                    await self.write_queue.put(batch)
 
                     # SECOND CACHE ENTRY POINT (after sampling): store latest avg/last
                     # values via update_block_devices -> update_device_cache -> merge.
