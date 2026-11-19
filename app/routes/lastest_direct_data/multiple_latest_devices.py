@@ -3,6 +3,7 @@ import logging
 from quart import Blueprint, request, jsonify
 from pathlib import Path
 
+from plant_architecture_resolver import PlantArchitectureResolver
 from runtime_paths import DataPaths
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,9 @@ multiple_latest_devices_bp = Blueprint(
     'multiple_latest_devices',
     __name__
 )
+
+# Read plant metadata with the selected JSON/Valkey sampled snapshot.
+device_resolver = PlantArchitectureResolver()
 
 PlantArchitecturePath = Path(DataPaths.resolve("plant_architecture"))
 
@@ -72,11 +76,9 @@ async def get_multiple_latest_devices_data():
 
         for device_id in device_ids:
             try:
-                device_file = _find_device_file(device_id)
-
-                with device_file.open("r", encoding="utf-8") as f:
-                    # FULL JSON (no key filtering)
-                    result[device_id] = json.load(f)
+                # Build a response from plant JSON metadata plus latest SAMPLED
+                # values from the selected store; this differs from mapped /stream.
+                result[device_id] = await device_resolver.resolve_block_device(device_id)
 
             except Exception as e:
                 logger.warning(f"Failed to load device {device_id}: {e}")

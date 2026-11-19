@@ -1,15 +1,12 @@
 import json
-import datetime
-from pathlib import Path
 import logging
 import asyncio
-import tempfile
 from collections import defaultdict
 import queue
-import os
 
 from threading import Lock
 
+from utils.telemetry_store import TelemetryStore
 from runtime_paths import DataPaths
 from utils.latest_telemetry_queue import LATEST_TELEMETRY_QUEUE
 
@@ -20,6 +17,10 @@ class LatestTelemetryManager:
         self.base_dir = DataPaths.resolve(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
+        # One mapped-stage store is shared by this manager's save entry points.
+        # "mapped" keeps these keys/files separate from sampled aggregates.
+        # Backend settings are captured now; restart workers after .env changes.
+        self.store = TelemetryStore("mapped", self.base_dir)
         self._latest_data = {}
         self._lock = Lock()
         self._locks = defaultdict(asyncio.Lock)
@@ -115,202 +116,40 @@ class LatestTelemetryManager:
                     continue
 
                 for device_id, merged_data in updates.items():
-                    self._write_device_file(
-                        device_id,
-                        merged_data
-                    )
+                    await self.save_device_data(device_id, merged_data)
                 
                 # await asyncio.sleep(1)
             except Exception as e:
                 logger.exception(f"Error While Updating Latest Telemetry: {e}")
 
     def _write_device_file(self, device_id: str, data: dict):
-        file_path = self.base_dir / f"{device_id}.json"
+        """Synchronous legacy writer; the method name no longer implies JSON-only.
 
-        try:
-            # load safely
-            if file_path.exists():
-                with open(file_path, "r") as f:
-                    try:
-                        existing_data = json.load(f).get("data", {})
-                    except Exception:
-                        existing_data = {}
-            else:
-                existing_data = {}
-
-            existing_data.update(data)
-
-            payload = {
-                "time_stamp": datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "data": existing_data,
-            }
-
-            tmp_path = file_path.with_suffix(".tmp")
-
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f, indent=2)
-
-            tmp_path.replace(file_path)  # atomic replace
-
-        except Exception as e:
-            logger.error(f"Failed writing {device_id}: {e}")
+        Used by older callers. merge() writes to the .env-selected backend and
+        preserves unsupplied tags. It blocks its caller; async workers should use
+        save_device_data() instead. Exceptions here propagate to the caller.
+        """
+        self.store.merge(device_id, data)
 
     def ppsave_device_data(self, device_id: str, data: dict):
-        file_path = self.base_dir / f"{device_id}.json"
+        """Keep the older public method working with JSON and Valkey.
 
+        This is another synchronous entry point, not a second/double write.
+        It delegates once to the same mapped-stage merge implementation.
+        """
+        self.store.merge(device_id, data)
+
+    async def save_device_data(self, device_id: str, data: dict):
+        """Persist one device's latest mapped tags without blocking the event loop.
+
+        PostMapper calls this method. amerge() runs synchronous file/network I/O
+        in a worker thread; await waits for that attempt to finish. The backend
+        is selected by self.store, so this function needs no JSON/Valkey branch.
+        """
+        # Do not stop the device batch when one snapshot write fails. Log the
+        # traceback instead. There is no automatic retry, fallback or success flag;
+        # a logged failure means this update is not guaranteed to have been saved.
         try:
-            # Load existing data if file exists
-            if file_path.exists():
-                with open(file_path, "r") as f:
-                    existing = json.load(f)
-                    existing_data = existing.get("data", {})
-            else:
-                existing_data = {}
-
-            # Merge new range data
-            existing_data.update(data)
-
-            data_to_write = {
-                "time_stamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "data": existing_data,
-            }
-
-            with open(file_path, "w") as f:
-                json.dump(data_to_write, f, indent=2)
-
-        except Exception as e:
-            logger.error(
-                f"[LatestTelemetryManager] Failed to write {device_id}.json: {e}"
-            )
-
-    async def save_device_data(
-        self,
-        device_id: str,
-        data: dict,
-    ):
-        lock = self._locks[device_id]
-
-        async with lock:
-
-            file_path = (
-                self.base_dir
-                / f"{device_id}.json"
-            )
-
-            try:
-                # ---------------------------------------------------------
-                # 1. Read existing JSON
-                # ---------------------------------------------------------
-
-                if file_path.exists():
-
-                    try:
-                        with open(
-                            file_path,
-                            "r",
-                            encoding="utf-8",
-                        ) as f:
-                            existing = json.load(f)
-
-                        existing_data = existing.get(
-                            "data",
-                            {},
-                        )
-
-                    except json.JSONDecodeError:
-                        # Existing file is already corrupted.
-                        #
-                        # Don't overwrite blindly without logging it.
-                        logger.error(
-                            "[LatestTelemetryManager] "
-                            "Corrupted JSON detected: %s",
-                            file_path,
-                        )
-
-                        existing_data = {}
-
-                else:
-                    existing_data = {}
-
-                # ---------------------------------------------------------
-                # 2. Merge new telemetry
-                # ---------------------------------------------------------
-
-                existing_data.update(data)
-
-                data_to_write = {
-                    "time_stamp": (
-                        datetime.datetime.now()
-                        .strftime("%Y-%m-%d %H:%M:%S")
-                    ),
-                    "data": existing_data,
-                }
-
-                # ---------------------------------------------------------
-                # 3. Atomic write
-                # ---------------------------------------------------------
-                #
-                # NEVER directly do:
-                #
-                #   open(file_path, "w")
-                #
-                # because a crash/interruption can leave a partially
-                # written JSON file.
-                #
-                # Instead:
-                #
-                #   write temporary file
-                #          ↓
-                #   flush + fsync
-                #          ↓
-                #   os.replace()
-                #
-                # os.replace() is atomic on the same filesystem.
-
-                directory = file_path.parent
-
-                fd, temp_path = tempfile.mkstemp(
-                    dir=directory,
-                    prefix=f".{device_id}.",
-                    suffix=".tmp",
-                )
-
-                try:
-
-                    with os.fdopen(
-                        fd,
-                        "w",
-                        encoding="utf-8",
-                    ) as f:
-
-                        json.dump(
-                            data_to_write,
-                            f,
-                            indent=2,
-                        )
-
-                        f.flush()
-                        os.fsync(f.fileno())
-
-                    os.replace(
-                        temp_path,
-                        file_path,
-                    )
-
-                except Exception:
-
-                    try:
-                        os.unlink(temp_path)
-                    except FileNotFoundError:
-                        pass
-
-                    raise
-
-            except Exception:
-                logger.exception(
-                    "[LatestTelemetryManager] "
-                    "Failed to write %s.json",
-                    device_id,
-                )
+            await self.store.amerge(device_id, data)
+        except Exception:
+            logger.exception("Mapped telemetry cache write failed for %s", device_id)

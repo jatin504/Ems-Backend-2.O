@@ -1,4 +1,4 @@
-from quart import Blueprint, request, jsonify
+from quart import Blueprint, request, jsonify, current_app
 from app.utils.dashboard_logger import insert_dashboard_log
 from app.utils.auth import hash_password, verify_password  # bcrypt helpers
 from app.utils.db_utils import DB
@@ -454,15 +454,7 @@ async def admin_set_password():
         return jsonify({"message": "Internal server error", "error": str(e)}), 500
 
 
-#  CORS 
-@users_bp.after_app_request
-async def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "http://localhost:4445"
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    return response
+# CORS is configured once on the application for both frontend origins.
 
 # Preflight endpoints
 @users_bp.route("/api/users", methods=["OPTIONS"])
@@ -477,7 +469,8 @@ async def users_cors_preflight(**kwargs):
 
 @users_bp.before_app_serving
 async def _seed_on_startup():
-    await _seed_default_user()
+    if current_app.config.get("EMS_API_ROLE", "primary") == "primary":
+        await _seed_default_user()
 
 
 # ---------------- VERIFY PASSWORD FOR CONTROL ACTIONS ----------------

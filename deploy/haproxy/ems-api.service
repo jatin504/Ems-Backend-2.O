@@ -1,0 +1,26 @@
+[Unit]
+Description=EMS API cluster supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ems
+Group=ems
+WorkingDirectory=/opt/ems
+ExecStart=/opt/ems/.venv/bin/python /opt/ems/run_api_cluster.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+KillMode=mixed
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
